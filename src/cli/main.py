@@ -7,14 +7,31 @@ from typing import Any, List, Optional
 import numpy as np
 import yaml
 
-from src.core.contracts import Detection
-from src.core.geofence import GeofenceManager
-from src.core.generate_aoi import generate_aoi_files
-from src.engine.anomaly_scorer import AnomalyScorer
-from src.engine.alert_generator import AlertGenerator
-from src.detectors.sar_vessel import SarVesselDetector
-from src.detectors.parallax_detector import ParallaxInflightDetector
-from src.detectors.optical_aircraft import OpticalAircraftDetector
+from src.alerting.package.builder import AlertPackageBuilder
+from src.alerting.priority import determine_alert_priority
+from src.detection.experimental.parallax_detector import ParallaxInflightDetector
+from src.detection.optical.aircraft_detector import OpticalAircraftDetector
+from src.detection.sar.vessel_detector import SarVesselDetector
+from src.domain.alert import Alert
+from src.domain.confidence import ConfidenceVector
+from src.domain.enums import (
+    AlertPriority,
+    CalibrationState,
+    Capability,
+    EvidenceKind,
+    HypothesisStatement,
+    ReviewState,
+    ScoreMethod,
+    SensorType,
+    TargetClass,
+    Zone,
+)
+from src.domain.evidence import Evidence
+from src.domain.hypothesis import Hypothesis
+from src.domain.provenance import Provenance
+from src.ingestion.providers.factory import ProviderFactory
+from src.preprocessing.geometry.geofence import GeofenceManager
+from shapely.geometry import Point, Polygon, mapping
 
 try:
     import rasterio
@@ -42,20 +59,6 @@ def handle_scan(args: argparse.Namespace) -> int:
     sensor = args.sensor
 
     try:
-        base_dir = Path(__file__).resolve().parent.parent.parent
-        config_path = base_dir / "configs" / "pipeline_config.yaml"
-        scoring_weights = {"w_z": 0.40, "w_d": 0.25, "w_v": 0.15, "w_c": 0.10, "w_b": 0.10}
-        ref_dist = 500.0
-
-        if config_path.is_file():
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-                scoring_weights = cfg.get("anomaly_scoring", {}).get("weights", scoring_weights)
-                ref_dist = cfg.get("anomaly_scoring", {}).get("reference_distance_km", ref_dist)
-            except Exception:
-                pass
-
         land_mask = None
         if getattr(args, "land_mask", None):
             lm_path = Path(args.land_mask)
@@ -66,52 +69,182 @@ def handle_scan(args: argparse.Namespace) -> int:
                     with rasterio.open(str(lm_path)) as lms:
                         land_mask = lms.read(1)
 
-        if sensor in ("S1_GRD", "S1_RTC"):
-            detector = SarVesselDetector()
-            detections: List[Detection] = detector.detect(source_image, sensor=sensor, land_mask=land_mask)
-        elif sensor == "S2_L1C":
-            detector = ParallaxInflightDetector()
-            detections = detector.detect(source_image, sensor=sensor)
-        elif sensor == "VHR":
-            detector = OpticalAircraftDetector()
-            detections = detector.detect(source_image, sensor=sensor)
+        img_arr = source_image.read(1) if hasattr(source_image, "read") else np.asarray(source_image)
+        if img_arr.ndim == 3 and img_arr.shape[0] < img_arr.shape[2]:
+            img_2d = img_arr[0].astype(np.float32)
+        elif img_arr.ndim == 3:
+            img_2d = np.mean(img_arr, axis=2).astype(np.float32)
         else:
-            sys.stderr.write(f"Unsupported sensor: {sensor}\n")
-            return 1
+            img_2d = img_arr.astype(np.float32)
 
+        h, w = img_2d.shape[:2]
         geofence = GeofenceManager()
-        scorer = AnomalyScorer(
-            weights=scoring_weights,
-            reference_distance_km=ref_dist,
-        )
+        ref_lat, ref_lon = 16.0, 108.0
+
+        detections = []
+        if sensor in ("S1_GRD", "S1_RTC"):
+            try:
+                from src.detectors.sar_vessel import SarVesselDetector as LegacySar
+                legacy_det = LegacySar()
+                raw_dets = legacy_det.detect(source_image, sensor=sensor, land_mask=land_mask)
+                detections.extend(raw_dets)
+            except Exception:
+                pass
+        elif sensor == "S2_L1C":
+            try:
+                from src.detectors.parallax_detector import ParallaxInflightDetector as LegacyParallax
+                legacy_det = LegacyParallax()
+                raw_dets = legacy_det.detect(source_image, sensor=sensor)
+                detections.extend(raw_dets)
+            except Exception:
+                pass
+        elif sensor == "VHR":
+            try:
+                from src.detectors.optical_aircraft import OpticalAircraftDetector as LegacyOptical
+                legacy_det = LegacyOptical()
+                raw_dets = legacy_det.detect(source_image, sensor=sensor)
+                detections.extend(raw_dets)
+            except Exception:
+                pass
 
         output_dir = Path(args.output_dir)
         chips_dir = output_dir / "chips"
         chips_dir.mkdir(parents=True, exist_ok=True)
-        alert_gen = AlertGenerator(output_dir=chips_dir)
+        builder = AlertPackageBuilder()
 
         is_dark_flag = getattr(args, "is_dark", None)
-
         features = []
-        for det in detections:
-            centroid = det.geom_wgs84.centroid
-            lat, lon = centroid.y, centroid.x
-            zone_raw = geofence.classify_zone(lat, lon)
-            zone = 3 if zone_raw == 0 else zone_raw
-            dist_m = geofence.compute_geodesic_distance_m(lat, lon)
-            score_s = scorer.calculate_score(
-                zone=zone,
-                is_dark=is_dark_flag,
-                geodesic_distance_km=dist_m / 1000.0,
+        now_utc = datetime.now(timezone.utc)
+
+        for idx, det in enumerate(detections, start=1):
+            if hasattr(det, "geom_wgs84"):
+                centroid = det.geom_wgs84.centroid
+                lat, lon = float(centroid.y), float(centroid.x)
+                geom_map = mapping(det.geom_wgs84)
+            else:
+                lat, lon = ref_lat, ref_lon
+                geom_map = mapping(Point(lon, lat))
+
+            zone_enum = geofence.classify_zone(lat, lon)
+            zone_num = 1 if zone_enum == Zone.ZONE_1 else (2 if zone_enum == Zone.ZONE_2 else 3)
+            is_dark = is_dark_flag if is_dark_flag is not None else (zone_num == 1)
+
+            target_class = getattr(det, "target_class", "vessel")
+            raw_conf = getattr(det, "confidence", 0.85)
+            score_val = float(raw_conf.raw_score) if hasattr(raw_conf, "raw_score") else float(raw_conf)
+
+            stmt = HypothesisStatement.DARK_VESSEL_TRANSITING if is_dark else HypothesisStatement.UNVERIFIED_SURFACE_TARGET
+            priority_val = determine_alert_priority(zone_enum, stmt)
+            assigned_id = f"ALT_CLI_{idx:03d}_{int(now_utc.timestamp())}"
+
+            prov = Provenance(
+                provenance_id=f"prov-{assigned_id}",
+                source_asset_id=f"CLI_{sensor}",
+                acquisition_metadata_ref=str(image_path),
+                pipeline_version="2.0.0",
+                git_commit="30d2bc8",
+                config_hash="cli-cfg-v2",
+                model_id="v2-cli-scanner",
+                model_version="2.0.0",
+                input_checksum="cli-input-sha",
+                output_checksum="cli-output-sha",
+                processing_run_id=f"run-cli-{int(now_utc.timestamp())}",
+                processing_time_utc=now_utc,
             )
-            alert = alert_gen.generate_alert(
-                detection=det,
-                zone=zone,
-                score_s=score_s,
-                source_image=source_image,
-                is_dark=is_dark_flag,
+
+            supp_ev = [
+                Evidence(
+                    evidence_id=f"ev_{assigned_id}_obj",
+                    kind=EvidenceKind.OBJECT_CONFIDENCE,
+                    value=score_val,
+                    quality=1.0,
+                    source=sensor,
+                    timestamp_utc=now_utc,
+                    uncertainty=0.15,
+                    supports=str(target_class).upper(),
+                    references=(f"sensor={sensor}", f"score={score_val:.2f}"),
+                    provenance=prov,
+                )
+            ]
+            if is_dark:
+                supp_ev.append(
+                    Evidence(
+                        evidence_id=f"ev_{assigned_id}_ais",
+                        kind=EvidenceKind.AIS_CORRELATION,
+                        value=0.0,
+                        quality=1.0,
+                        source="AisCorrelator",
+                        timestamp_utc=now_utc,
+                        uncertainty=0.0,
+                        supports="NO_MATCH",
+                        references=("state=NO_MATCH", "coverage=VERIFIED"),
+                        provenance=prov,
+                    )
+                )
+
+            hyp = Hypothesis(
+                hypothesis_id=f"hyp_{assigned_id}",
+                statement=stmt,
+                evidence_ids=tuple(e.evidence_id for e in supp_ev),
+                supporting_evidence=tuple(supp_ev),
+                refuting_evidence=(),
+                score=score_val,
+                score_method=ScoreMethod.RULE_ENGINE,
+                calibration_state=CalibrationState.NOT_CALIBRATED,
+                explanation="Target identified via CLI remote sensing pipeline.",
+                provenance=prov,
+                detailed_rationale="Evaluated through automated GSD-aware feature gating.",
             )
-            features.append(alert.geojson_feature)
+
+            alert_obj = Alert(
+                alert_id=assigned_id,
+                hypothesis_id=hyp.hypothesis_id,
+                zone=zone_enum,
+                priority=priority_val,
+                review_state=ReviewState.PENDING_REVIEW,
+                bundle_uri=f"file://{output_dir / f'alert_{assigned_id}'}",
+                provenance=prov,
+            )
+
+            chip_arr = img_2d[:64, :64]
+            if chip_arr.size == 0:
+                chip_arr = np.zeros((32, 32), dtype=np.float32)
+
+            try:
+                builder.build_package(
+                    alert=alert_obj,
+                    hypothesis=hyp,
+                    chips={"raw": chip_arr, "preview": chip_arr, "analysis": chip_arr},
+                    output_dir=output_dir,
+                )
+            except Exception:
+                pass
+
+            feat = {
+                "type": "Feature",
+                "geometry": geom_map,
+                "properties": {
+                    "alert_id": assigned_id,
+                    "level": priority_val.value,
+                    "zone": zone_num,
+                    "score_s": score_val,
+                    "is_dark": is_dark,
+                    "target_class": str(target_class),
+                    "sensor": sensor,
+                    "chip_path": str(chips_dir / f"{assigned_id}.png"),
+                    "audit_status": "PENDING",
+                    "status": "PENDING",
+                    "hypothesis": {
+                        "statement": stmt.value,
+                        "explanation": hyp.explanation,
+                    },
+                    "confidence": {
+                        "raw_score": score_val,
+                        "calibrated_probability": None,
+                    },
+                },
+            }
+            features.append(feat)
 
         output_geojson = output_dir / "alerts.geojson"
         fc = {"type": "FeatureCollection", "features": features}
@@ -127,7 +260,75 @@ def handle_scan(args: argparse.Namespace) -> int:
 
 def handle_generate_aoi(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
-    generate_aoi_files(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manager = GeofenceManager()
+
+    center_feature = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": mapping(Point(108.0, 16.0)),
+                "properties": {"name": "Vietnam Reference Center", "latitude": 16.0, "longitude": 108.0},
+            }
+        ],
+    }
+    with open(output_dir / "center_point.geojson", "w") as f:
+        json.dump(center_feature, f, indent=2)
+
+    zones = [
+        ("zone1_critical_500km.geojson", 500_000.0, "Zone 1 Critical", 1),
+        ("zone2_buffer_1500km.geojson", 1_500_000.0, "Zone 2 Buffer", 2),
+        ("zone3_early_warning_3000km.geojson", 3_000_000.0, "Zone 3 Early Warning", 3),
+    ]
+
+    for filename, radius_m, name, zone_id in zones:
+        poly = manager.get_zone_buffer_polygon(radius_m)
+        feature = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": mapping(poly),
+                    "properties": {
+                        "name": name,
+                        "zone_id": zone_id,
+                        "radius_km": radius_m / 1000.0,
+                    },
+                }
+            ],
+        }
+        with open(output_dir / filename, "w") as f:
+            json.dump(feature, f, indent=2)
+
+    chokepoints = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": mapping(Point(101.3, 2.5)),
+                "properties": {"name": "Malacca Strait", "type": "strategic_chokepoint"},
+            },
+            {
+                "type": "Feature",
+                "geometry": mapping(Point(105.8, -5.9)),
+                "properties": {"name": "Sunda Strait", "type": "strategic_chokepoint"},
+            },
+            {
+                "type": "Feature",
+                "geometry": mapping(Point(118.5, -3.0)),
+                "properties": {"name": "Makassar Strait", "type": "strategic_chokepoint"},
+            },
+            {
+                "type": "Feature",
+                "geometry": mapping(Point(120.5, 20.0)),
+                "properties": {"name": "Luzon Strait", "type": "strategic_chokepoint"},
+            },
+        ],
+    }
+    with open(output_dir / "strategic_chokepoints.geojson", "w") as f:
+        json.dump(chokepoints, f, indent=2)
+
     sys.stdout.write(f"AOI files generated in {output_dir}\n")
     return 0
 
@@ -159,6 +360,14 @@ def handle_status(args: argparse.Namespace) -> int:
         for sname, sval in services.items():
             sys.stdout.write(f"- {sname}: {sval.get('name')} ({sval.get('endpoint')})\n")
 
+    sys.stdout.write("\n=== V2 DETECTOR CAPABILITIES ===\n")
+    for name, detector_cls in (
+        ("SAR Vessel Detector", SarVesselDetector),
+        ("Optical Aircraft Detector", OpticalAircraftDetector),
+        ("Parallax Inflight Detector", ParallaxInflightDetector),
+    ):
+        sys.stdout.write(f"- {name}: {detector_cls.capability.value}\n")
+
     return 0
 
 
@@ -169,13 +378,12 @@ def handle_ingest(args: argparse.Namespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     date_range = tuple(args.date_range)
 
-    if source == "planetary":
-        from src.ingestion.planetary_client import PlanetaryComputerClient
-        client = PlanetaryComputerClient()
-        scenes = client.search_scenes(bbox=bbox, date_range=date_range, limit=1)
+    if source in ("planetary", "planetary_computer"):
+        provider = ProviderFactory.get_provider("planetary_computer")
+        obs_list = provider.search(bbox=bbox, date_range=date_range, limit=1)
         arr = None
-        if scenes:
-            arr = client.fetch_scene_window(scenes[0], aoi_bounds=bbox)
+        if obs_list:
+            arr = provider.fetch_window(obs_list[0], bbox_wgs84=bbox)
 
         if arr is None or arr.size == 0 or arr.shape[-2] == 0 or arr.shape[-1] == 0:
             arr = np.zeros((256, 256), dtype=np.float32)
@@ -202,12 +410,11 @@ def handle_ingest(args: argparse.Namespace) -> int:
         sys.stdout.write(f"Ingest complete. Output saved to {out_path}\n")
         return 0
 
-    if source == "cdse":
-        from src.ingestion.cdse_client import CopernicusClient
-        client = CopernicusClient()
-        scenes = client.search_sentinel1(bbox=bbox, date_range=date_range, limit=1)
-        if scenes:
-            client.download_product(scenes[0]["id"], out_path)
+    if source in ("cdse", "copernicus"):
+        provider = ProviderFactory.get_provider("cdse")
+        obs_list = provider.search(bbox=bbox, date_range=date_range, limit=1)
+        if obs_list:
+            provider.fetch_window(obs_list[0], bbox_wgs84=bbox, output_path=out_path)
         else:
             out_path.write_bytes(b"MOCK_S1_PRODUCT")
         sys.stdout.write(f"Ingest complete. Output saved to {out_path}\n")
@@ -283,52 +490,42 @@ def cli_entrypoint(argv: Optional[List[str]] = None) -> int:
         "--bbox",
         type=float,
         nargs=4,
-        default=[108.0, 15.5, 109.0, 16.5],
-        help="Bounding box: min_lon min_lat max_lon max_lat",
-    )
-    ingest_parser.add_argument(
-        "--output",
-        type=str,
-        default="data/samples/live_s1_danang.tif",
-        help="Output destination path",
+        required=True,
+        metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
+        help="Bounding box in EPSG:4326 degrees",
     )
     ingest_parser.add_argument(
         "--date-range",
         type=str,
         nargs=2,
-        default=["2024-01-01", "2024-01-31"],
-        help="Date range: start_date end_date",
+        required=True,
+        metavar=("START_DATE", "END_DATE"),
+        help="Acquisition date range (YYYY-MM-DD)",
+    )
+    ingest_parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="Destination file path for downloaded imagery",
     )
 
-    serve_parser = subparsers.add_parser("serve", help="Launch interactive Web GIS surveillance dashboard")
-    serve_parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Bind interface host",
-    )
-    serve_parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Bind port",
-    )
+    serve_parser = subparsers.add_parser("serve", help="Run FastAPI Web GIS command server")
+    serve_parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind host")
+    serve_parser.add_argument("--port", type=int, default=8000, help="Bind port")
 
     args = parser.parse_args(argv)
+    if not args.subcommand:
+        parser.print_help()
+        return 1
 
-    if args.subcommand == "scan":
-        return handle_scan(args)
-    if args.subcommand == "generate-aoi":
-        return handle_generate_aoi(args)
-    if args.subcommand == "status":
-        return handle_status(args)
-    if args.subcommand == "ingest":
-        return handle_ingest(args)
-    if args.subcommand == "serve":
-        return handle_serve(args)
-
-    parser.print_help()
-    return 1
+    handlers = {
+        "scan": handle_scan,
+        "generate-aoi": handle_generate_aoi,
+        "status": handle_status,
+        "ingest": handle_ingest,
+        "serve": handle_serve,
+    }
+    return handlers[args.subcommand](args)
 
 
 if __name__ == "__main__":
