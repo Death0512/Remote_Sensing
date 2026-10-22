@@ -1,0 +1,19 @@
+models:
+  sar_vessel_detect:
+    task: "sar_vessel_detection"
+    architecture: "FasterRCNN"
+    url: "https://prior-artifacts.s3.us-west-2.amazonaws.com/sar_vessel_detect/weights.pt"
+    sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    local_path: "data/weights/sar_vessel_detect.pt"
+  yolov8_obb:
+    task: "optical_aircraft_detection"
+    architecture: "YOLOv8-OBB"
+    url: "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n-obb.pt"
+    sha256: "fa6e4cd2691f132875c143135affaa66b5d89394ebb1d07d19770a9b6382c1b8"
+    local_path: "data/weights/yolov8n-obb.pt"
+  ds_unet:
+    task: "bitemporal_change_detection"
+    architecture: "DualStreamUNet"
+    url: "https://prior-artifacts.s3.us-west-2.amazonaws.com/ds_unet/weights.pt"
+    sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    local_path: "data/weights/ds_unet.pt"

@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VIETNAM NATIONAL TERRITORIAL REMOTE SENSING COMMAND</title>
+    <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header class="tactical-header">
+        <div class="header-brand">
+            <div class="radar-emblem"></div>
+            <div>
+                <h1>VIETNAM NATIONAL TERRITORIAL REMOTE SENSING COMMAND</h1>
+                <div class="subtitle">TACTICAL DEFENSE &amp; MARITIME SURVEILLANCE GIS</div>
+            </div>
+        </div>
+        <div class="header-metrics">
+            <div class="metric-box">
+                <span class="metric-label">SYSTEM HEALTH</span>
+                <span class="metric-value status-online" id="sys-health">OPERATIONAL</span>
+            </div>
+            <div class="metric-box">
+                <span class="metric-label">ACTIVE ALERTS</span>
+                <span class="metric-value text-red" id="active-alert-count">0</span>
+            </div>
+            <div class="metric-box">
+                <span class="metric-label">PENDING AUDIT</span>
+                <span class="metric-value text-amber" id="pending-audit-count">0</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="main-layout">
+        <aside class="tactical-sidebar">
+            <div class="scanner-panel">
+                <h3>LIVE SATELLITE SCANNER (AOI)</h3>
+                <div class="filter-group">
+                    <label for="scan-preset">STRATEGIC PRESET</label>
+                    <select id="scan-preset">
+                        <option value="none">Current Map View</option>
+                        <option value="danang">Da Nang Bay &amp; Naval Base</option>
+                        <option value="camranh">Cam Ranh Bay &amp; Base</option>
+                        <option value="truongsa">Spratly Islands / Truong Sa</option>
+                        <option value="hoangsa">Paracel Islands / Hoang Sa</option>
+                        <option value="malacca">Malacca Strait Chokepoint</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="scan-source">SCAN SENSOR SOURCE</label>
+                    <select id="scan-source">
+                        <option value="satellite_hd">ESRI World Imagery HD</option>
+                        <option value="nasa_gibs">NASA GIBS Daily VIIRS</option>
+                        <option value="sentinel2">Sentinel-2 Cloudless</option>
+                    </select>
+                </div>
+                <div class="scanner-actions">
+                    <button class="btn btn-scan" id="btn-scan-aoi">SCAN AREA / VIEW</button>
+                    <button class="btn btn-draw" id="btn-draw-aoi">DRAW AOI BOX</button>
+                </div>
+                <div class="scanner-status" id="scan-status">Ready. Select hot-spot or current view to scan.</div>
+            </div>
+
+            <div class="filter-panel">
+                <h3>SURVEILLANCE FILTERS</h3>
+                <div class="filter-group">
+                    <label for="filter-zone">ZONE</label>
+                    <select id="filter-zone">
+                        <option value="ALL">All Zones</option>
+                        <option value="1">Zone 1 (500 km - Intercept)</option>
+                        <option value="2">Zone 2 (1500 km - Tracking)</option>
+                        <option value="3">Zone 3 (3000 km - Early Warning)</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-level">SEVERITY</label>
+                    <select id="filter-level">
+                        <option value="ALL">All Severities</option>
+                        <option value="CRITICAL">CRITICAL</option>
+                        <option value="HIGH">HIGH</option>
+                        <option value="STRATEGIC">STRATEGIC</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label for="filter-status">AUDIT STATUS</label>
+                    <select id="filter-status">
+                        <option value="ALL">All Statuses</option>
+                        <option value="PENDING">PENDING</option>
+                        <option value="CONFIRMED">CONFIRMED</option>
+                        <option value="DISMISSED">DISMISSED</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="alert-feed-container">
+                <h3>REAL-TIME ALERT FEED</h3>
+                <div class="alert-list" id="alert-list"></div>
+            </div>
+
+            <div class="inspection-drawer" id="inspection-drawer">
+                <div class="drawer-header">
+                    <h3>TARGET INSPECTION</h3>
+                    <span id="inspect-status-badge" class="badge">NONE</span>
+                </div>
+                <div class="drawer-body" id="drawer-body">
+                    <p class="empty-state">Select an alert from map or feed to inspect.</p>
+                </div>
+            </div>
+        </aside>
+
+        <main class="map-container-wrapper">
+            <div class="map-container" id="map"></div>
+
+            <div class="layer-switcher-panel">
+                <div class="layer-switcher-header">SURVEILLANCE LAYERS</div>
+                <div class="layer-options">
+                    <label class="layer-option">
+                        <input type="radio" name="baselayer" value="satellite" checked>
+                        <span>Satellite HD (ESRI)</span>
+                    </label>
+                    <label class="layer-option">
+                        <input type="radio" name="baselayer" value="dark">
+                        <span>Tactical Dark</span>
+                    </label>
+                    <label class="layer-option">
+                        <input type="radio" name="baselayer" value="ocean">
+                        <span>Ocean Depth (ArcGIS)</span>
+                    </label>
+                    <label class="layer-option">
+                        <input type="radio" name="baselayer" value="topo">
+                        <span>Topography (OpenTopo)</span>
+                    </label>
+                    <label class="layer-option">
+                        <input type="radio" name="baselayer" value="gibs">
+                        <span>NASA GIBS Daily</span>
+                    </label>
+                </div>
+                <div class="layer-divider"></div>
+                <div class="layer-overlay-group">
+                    <label class="layer-option">
+                        <input type="checkbox" id="toggle-seamarks" checked>
+                        <span>Nautical Seamarks (OpenSeaMap)</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="gibs-timeline-bar" id="gibs-timeline-bar">
+                <div class="timeline-title">NASA GIBS DAILY SATELLITE TIMELINE</div>
+                <div class="timeline-controls">
+                    <button class="btn-time-step" id="btn-time-prev7">-7d</button>
+                    <button class="btn-time-step" id="btn-time-prev1">-1d</button>
+                    <input type="range" id="gibs-slider" min="0" max="1025" value="1025" class="time-range-slider">
+                    <button class="btn-time-step" id="btn-time-next1">+1d</button>
+                    <button class="btn-time-step" id="btn-time-next7">+7d</button>
+                    <button class="btn-time-step btn-today" id="btn-time-today">TODAY</button>
+                    <input type="date" id="gibs-date-picker" class="time-date-picker" value="2026-10-22" min="2024-01-01" max="2026-10-22">
+                    <span class="timeline-date-badge" id="gibs-date-badge">2026-10-22</span>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <script src="/static/app.js"></script>
+</body>
+</html>

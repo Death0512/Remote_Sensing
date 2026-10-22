@@ -1,0 +1,22 @@
+services:
+  copernicus_stac:
+    name: "Copernicus Data Space Ecosystem STAC API"
+    endpoint: "https://catalogue.dataspace.copernicus.eu/stac"
+    auth_type: "oauth2"
+    token_url: "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
+    collections:
+      - "SENTINEL-1"
+      - "SENTINEL-2"
+  planetary_computer:
+    name: "Microsoft Planetary Computer STAC API"
+    endpoint: "https://planetarycomputer.microsoft.com/api/stac/v1"
+    auth_type: "sas_token"
+    collections:
+      - "sentinel-1-rtc"
+      - "sentinel-1-grd"
+      - "sentinel-2-l2a"
+  gfw_api:
+    name: "Global Fishing Watch 4Wings API"
+    endpoint: "https://gateway.api.globalfishingwatch.org/v3"
+    auth_type: "bearer"
+    latency_profile: "retrospective"

@@ -1,0 +1,61 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          101.3,
+          2.5
+        ]
+      },
+      "properties": {
+        "name": "Malacca Strait",
+        "type": "strategic_chokepoint"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          105.8,
+          -5.9
+        ]
+      },
+      "properties": {
+        "name": "Sunda Strait",
+        "type": "strategic_chokepoint"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          115.7,
+          -8.5
+        ]
+      },
+      "properties": {
+        "name": "Lombok Strait",
+        "type": "strategic_chokepoint"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          121.0,
+          20.5
+        ]
+      },
+      "properties": {
+        "name": "Bashi Channel",
+        "type": "strategic_chokepoint"
+      }
+    }
+  ]
+}

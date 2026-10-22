@@ -1,0 +1,20 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          108.0,
+          16.0
+        ]
+      },
+      "properties": {
+        "name": "Vietnam Reference Center",
+        "latitude": 16.0,
+        "longitude": 108.0
+      }
+    }
+  ]
+}

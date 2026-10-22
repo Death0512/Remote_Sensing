@@ -1,0 +1,25 @@
+center:
+  latitude: 16.0
+  longitude: 108.0
+  datum: "WGS84"
+zones:
+  zone1:
+    name: "Critical Zone"
+    min_radius_km: 0.0
+    max_radius_km: 500.0
+    level: "CRITICAL"
+    max_latency_minutes: 30
+  zone2:
+    name: "Approach Buffer"
+    min_radius_km: 500.0
+    max_radius_km: 1500.0
+    level: "HIGH"
+    max_latency_minutes: 60
+  zone3:
+    name: "Early Warning Buffer"
+    min_radius_km: 1500.0
+    max_radius_km: 3000.0
+    level: "STRATEGIC"
+    max_latency_minutes: 180
+projection:
+  aeqd: "+proj=aeqd +lat_0=16.0 +lon_0=108.0 +datum=WGS84 +units=m +no_defs"

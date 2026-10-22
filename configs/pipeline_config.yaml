@@ -1,0 +1,24 @@
+tiling:
+  tile_size: 800
+  overlap_px: 128
+  gdal_cachemax_mb: 512
+
+cfar:
+  algorithm: "OS-CFAR"
+  pfa: 1.0e-5
+  guard_m: 50.0
+  train_m: 200.0
+  k_order_ratio: 0.75
+
+anomaly_scoring:
+  weights:
+    w_z: 0.40
+    w_d: 0.25
+    w_v: 0.15
+    w_c: 0.10
+    w_b: 0.10
+  reference_distance_km: 500.0
+
+dedup:
+  rotated_iou_threshold: 0.30
+  point_distance_px: 20.0
