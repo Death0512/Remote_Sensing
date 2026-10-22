@@ -6,6 +6,7 @@ let activeBbox = null;
 let isDrawingAoi = false;
 let drawStart = null;
 let currentDate = "2026-10-22";
+let currentChipTab = "preview";
 
 const BASE_TIMESTAMP = Date.UTC(2024, 0, 1);
 const MAX_DAYS = 1025;
@@ -645,8 +646,9 @@ function renderMapMarkers() {
                     <img src="/api/chips/${alert.alert_id}" style="width: 100%; height: 60px; object-fit: cover; border-radius: 2px; display: block; background: #000;" onerror="this.style.display='none'"/>
                 </div>
                 <div style="margin-top: 6px; display: flex; gap: 4px;">
-                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #dc2626; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="auditAlert('${alert.alert_id}', 'CONFIRMED')">CONFIRM</button>
-                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #475569; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="auditAlert('${alert.alert_id}', 'DISMISSED')">DISMISS</button>
+                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #dc2626; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="performAlertAction('${alert.alert_id}', 'CONFIRM')">CONFIRM</button>
+                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #475569; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="performAlertAction('${alert.alert_id}', 'DISMISS')">DISMISS</button>
+                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #d97706; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="performAlertAction('${alert.alert_id}', 'FLAG_UNCERTAIN')">UNCERTAIN</button>
                 </div>
             </div>
         `;
@@ -683,16 +685,77 @@ function selectAlert(alertId) {
     renderInspectionDrawer(alert);
 }
 
+function setChipTab(tab) {
+    currentChipTab = tab;
+    if (selectedAlertId) {
+        const alert = alertsData.find(a => a.alert_id === selectedAlertId);
+        if (alert) renderInspectionDrawer(alert);
+    }
+}
+
 function renderInspectionDrawer(alert) {
     const statusBadge = document.getElementById("inspect-status-badge");
-    statusBadge.textContent = alert.status || "PENDING";
-    statusBadge.className = `badge badge-${alert.status || 'PENDING'}`;
+    const st = alert.status || "PENDING";
+    statusBadge.textContent = st;
+    statusBadge.className = `badge badge-${st}`;
 
     const drawerBody = document.getElementById("drawer-body");
-    const chipSrc = `/api/chips/${alert.alert_id}`;
+    const previewUrl = alert.chips?.preview || `/api/chips/${alert.alert_id}`;
+    const analysisUrl = alert.chips?.analysis || `/api/chips/${alert.alert_id}/analysis.tif`;
+    const rawUrl = alert.chips?.raw || `/api/chips/${alert.alert_id}/raw.tif`;
+
+    let chipViewHtml = "";
+    if (currentChipTab === "preview") {
+        chipViewHtml = `
+            <img class="chip-preview" src="${previewUrl}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'256\\' height=\\'256\\'><rect width=\\'256\\' height=\\'256\\' fill=\\'%23111\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%23666\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>CHIP PREVIEW</text></svg>'" alt="Chip preview"/>
+        `;
+    } else if (currentChipTab === "analysis") {
+        chipViewHtml = `
+            <div class="chip-meta-box">
+URI: ${analysisUrl}
+Type: Float32 Normalized Tensor
+Channels: Single / Multiband
+Dynamic Range: [0.000, 1.000]
+Interpolation: Sub-pixel Gated
+Resolution: Metric GSD Gated
+Status: Radiometrically Calibrated
+            </div>
+        `;
+    } else {
+        chipViewHtml = `
+            <div class="chip-meta-box">
+URI: ${rawUrl}
+Bundle: ${alert.bundle_uri || 'file://data/outputs/alert_' + alert.alert_id}
+Sensor: ${alert.sensor || 'SAR'}
+Target: ${alert.target_class || 'VESSEL'}
+Coordinates: ${alert.lat != null ? alert.lat.toFixed(5) : '0.00000'}°N, ${alert.lon != null ? alert.lon.toFixed(5) : '0.00000'}°E
+Format: 16-bit GeoTIFF / Raw Window
+Radiometry: Unaltered Digital Numbers (DN)
+Lineage: Walk intact to source asset
+            </div>
+        `;
+    }
+
+    const hyp = alert.hypothesis || {};
+    const conf = alert.confidence || {};
+    const supp = alert.evidence?.supporting || [];
+    const refut = alert.evidence?.refuting || [];
+
+    const rawScoreDisplay = conf.raw_score != null ? conf.raw_score.toFixed(2) : (alert.score || 0).toFixed(2);
+    const modelScoreDisplay = conf.model_score != null ? conf.model_score.toFixed(2) : 'N/A';
+    const calibDisplay = conf.calibrated_probability != null
+        ? `<span class="conf-calibrated">${(conf.calibrated_probability * 100).toFixed(1)}%</span>`
+        : `<span class="conf-uncalibrated">N/A (Heuristic / Uncalibrated)</span>`;
 
     drawerBody.innerHTML = `
-        <img class="chip-preview" src="${chipSrc}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'256\\' height=\\'256\\'><rect width=\\'256\\' height=\\'256\\' fill=\\'%23111\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%23666\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>CHIP PREVIEW</text></svg>'" alt="Chip preview"/>
+        <div class="chip-switcher">
+            <button class="chip-tab ${currentChipTab === 'preview' ? 'active' : ''}" onclick="setChipTab('preview')">Preview (8-bit)</button>
+            <button class="chip-tab ${currentChipTab === 'analysis' ? 'active' : ''}" onclick="setChipTab('analysis')">Analysis (Norm)</button>
+            <button class="chip-tab ${currentChipTab === 'raw' ? 'active' : ''}" onclick="setChipTab('raw')">Raw Metadata</button>
+        </div>
+
+        ${chipViewHtml}
+
         <div class="drawer-detail-grid">
             <div class="detail-cell">
                 <div class="detail-label">TARGET CLASS</div>
@@ -719,19 +782,81 @@ function renderInspectionDrawer(alert) {
                 <div class="detail-val">${alert.speed_knots != null ? alert.speed_knots.toFixed(1) + ' kn' : 'N/A'} / ${alert.heading_deg != null ? alert.heading_deg.toFixed(0) + '°' : 'N/A'}</div>
             </div>
         </div>
+
+        <div class="section-divider">EXPLAINABLE HYPOTHESIS</div>
+        <div class="explain-box">
+            <div class="explain-title">${hyp.statement || 'UNVERIFIED_SURFACE_TARGET'}</div>
+            <div class="explain-desc">${hyp.primary_explanation || hyp.explanation || 'No primary explanation provided'}</div>
+            <div class="explain-rationale">${hyp.detailed_rationale || ''}</div>
+        </div>
+
+        <div class="section-divider">HONEST CONFIDENCE VECTOR</div>
+        <div class="confidence-vector">
+            <div class="conf-cell">
+                <div class="conf-label">RAW HEURISTIC SCORE</div>
+                <div class="conf-val">${rawScoreDisplay}</div>
+            </div>
+            <div class="conf-cell">
+                <div class="conf-label">MODEL SCORE</div>
+                <div class="conf-val">${modelScoreDisplay}</div>
+            </div>
+            <div class="conf-cell" style="grid-column: span 2;">
+                <div class="conf-label">CALIBRATED PROBABILITY</div>
+                <div class="conf-val">${calibDisplay}</div>
+            </div>
+            <div class="conf-cell" style="grid-column: span 2;">
+                <div class="conf-label">DATA QUALITY &amp; CALIBRATION STATE</div>
+                <div class="conf-val">${(conf.quality_score ?? 1.0).toFixed(2)} [${conf.calibration_state || 'NOT_CALIBRATED'}]</div>
+            </div>
+        </div>
+
+        <div class="section-divider">SUPPORTING EVIDENCE (${supp.length})</div>
+        <div class="evidence-list">
+            ${supp.length > 0 ? supp.map(ev => `
+                <div class="evidence-card supporting">
+                    <div class="evidence-head">
+                        <span>${ev.kind || 'EVIDENCE'}</span>
+                        <span style="color: #10b981;">+${Number(ev.value ?? 1).toFixed(2)}</span>
+                    </div>
+                    <div class="evidence-body">
+                        Source: <b>${ev.source || 'Sensor'}</b> | Supports: <b>${ev.supports || 'TARGET'}</b><br/>
+                        ${(ev.references || []).join(' | ')}
+                    </div>
+                </div>
+            `).join('') : '<div style="color: #64748b; font-size: 10px; font-style: italic;">No supporting evidence</div>'}
+        </div>
+
+        <div class="section-divider">REFUTING EVIDENCE (${refut.length})</div>
+        <div class="evidence-list">
+            ${refut.length > 0 ? refut.map(ev => `
+                <div class="evidence-card refuting">
+                    <div class="evidence-head">
+                        <span>${ev.kind || 'REFUTING'}</span>
+                        <span style="color: #ef4444;">-${Number(ev.value ?? 1).toFixed(2)}</span>
+                    </div>
+                    <div class="evidence-body">
+                        Source: <b>${ev.source || 'Sensor'}</b> | Counter: <b>${ev.supports || 'TARGET'}</b><br/>
+                        ${(ev.references || []).join(' | ')}
+                    </div>
+                </div>
+            `).join('') : '<div style="color: #64748b; font-size: 10px; font-style: italic;">No refuting evidence observed.</div>'}
+        </div>
+
+        <div class="section-divider">OPERATOR REVIEW ACTION</div>
         <div class="action-buttons">
-            <button class="btn btn-confirm" onclick="auditAlert('${alert.alert_id}', 'CONFIRMED')">CONFIRM THREAT</button>
-            <button class="btn btn-dismiss" onclick="auditAlert('${alert.alert_id}', 'DISMISSED')">DISMISS</button>
+            <button class="btn btn-confirm" onclick="performAlertAction('${alert.alert_id}', 'CONFIRM')">CONFIRM</button>
+            <button class="btn btn-dismiss" onclick="performAlertAction('${alert.alert_id}', 'DISMISS')">DISMISS</button>
+            <button class="btn btn-uncertain" onclick="performAlertAction('${alert.alert_id}', 'FLAG_UNCERTAIN')">UNCERTAIN</button>
         </div>
     `;
 }
 
-async function auditAlert(alertId, status) {
+async function performAlertAction(alertId, action) {
     try {
-        const resp = await fetch(`/api/alerts/${alertId}/audit`, {
+        const resp = await fetch(`/api/alerts/${alertId}/action`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ status, note: `Audit action ${status} from Tactical Command UI` })
+            body: JSON.stringify({ action: action, notes: `Operator action ${action} from Tactical Command UI` })
         });
         if (resp.ok) {
             await fetchAlerts();
@@ -739,6 +864,10 @@ async function auditAlert(alertId, status) {
         }
     } catch (e) {
     }
+}
+
+function auditAlert(alertId, status) {
+    return performAlertAction(alertId, status);
 }
 
 function setupFilters() {

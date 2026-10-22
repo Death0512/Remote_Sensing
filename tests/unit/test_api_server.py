@@ -167,3 +167,90 @@ def test_scan_map_aoi_sources(client: TestClient):
     assert resp_s2.status_code == 200
     assert resp_s2.json()["source"] == "sentinel2"
 
+
+def test_get_alert_by_id_v2_contracts(client: TestClient):
+    resp = client.get("/api/alerts/ALT_TEST_001")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["alert_id"] == "ALT_TEST_001"
+    assert "hypothesis" in data
+    assert "statement" in data["hypothesis"]
+    assert "primary_explanation" in data["hypothesis"]
+    assert "detailed_rationale" in data["hypothesis"]
+
+    assert "confidence" in data
+    assert data["confidence"]["calibrated_probability"] is None
+    assert data["confidence"]["calibration_state"] == "NOT_CALIBRATED"
+    assert "quality_score" in data["confidence"]
+
+    assert "evidence" in data
+    assert "supporting" in data["evidence"]
+    assert len(data["evidence"]["supporting"]) >= 1
+    assert "refuting" in data["evidence"]
+
+    assert "chips" in data
+    assert "preview" in data["chips"]
+    assert "analysis" in data["chips"]
+    assert "raw" in data["chips"]
+
+    resp_not_found = client.get("/api/alerts/NONEXISTENT_ID")
+    assert resp_not_found.status_code == 404
+
+
+def test_alert_action_endpoint_tamper_resistant_hash(client: TestClient):
+    resp = client.post(
+        "/api/alerts/ALT_TEST_001/action",
+        json={"action": "FLAG_UNCERTAIN", "operator_id": "op_alpha", "notes": "Suspected decoy"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["alert_id"] == "ALT_TEST_001"
+    assert data["status"] == "FLAGGED_UNCERTAIN"
+    assert data["action"] == "FLAG_UNCERTAIN"
+    assert "entry_hash" in data
+    assert len(data["entry_hash"]) == 64
+    assert data["previous_hash"] == "GENESIS"
+
+    resp_list = client.get("/api/alerts")
+    assert resp_list.status_code == 200
+    assert resp_list.json()[0]["status"] == "FLAGGED_UNCERTAIN"
+
+
+def test_status_endpoint_returns_capabilities(client: TestClient):
+    resp = client.get("/api/status")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "capabilities" in data
+    caps = data["capabilities"]
+    assert caps["sar_vessel_detector"] == "IMPLEMENTED"
+    assert caps["review_audit_store"] == "IMPLEMENTED"
+    assert caps["alert_package_builder"] == "IMPLEMENTED"
+    assert caps["hypothesis_engine"] == "IMPLEMENTED"
+    assert "providers" in caps
+    assert caps["providers"]["planetary_computer"] == "IMPLEMENTED"
+    assert caps["providers"]["cdse"] == "IMPLEMENTED"
+    assert caps["providers"]["mock"] == "MOCK"
+
+
+def test_multitier_chips_endpoint(client: TestClient):
+    from src.api.server import OUTPUTS_DIR
+    chip_dir = OUTPUTS_DIR / "chips"
+    chip_dir.mkdir(parents=True, exist_ok=True)
+    prev_file = chip_dir / "preview_test.png"
+    prev_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+    raw_file = chip_dir / "raw_test.tif"
+    raw_file.write_bytes(b"II*\x00")
+    try:
+        resp_prev = client.get("/api/chips/preview_test.png")
+        assert resp_prev.status_code == 200
+        assert resp_prev.headers["content-type"] == "image/png"
+
+        resp_raw = client.get("/api/chips/raw_test.tif")
+        assert resp_raw.status_code == 200
+        assert resp_raw.headers["content-type"] == "image/tiff"
+    finally:
+        if prev_file.exists():
+            prev_file.unlink()
+        if raw_file.exists():
+            raw_file.unlink()
+
