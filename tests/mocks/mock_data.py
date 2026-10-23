@@ -1,8 +1,19 @@
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Tuple
 import numpy as np
 
-from src.engine.fusion import AisRecord
+
+@dataclass(frozen=True)
+class AisRecord:
+    mmsi: str
+    lat: float
+    lon: float
+    timestamp: datetime
+    vessel_name: str
+    vessel_type: str
+    speed_knots: float
+    heading_deg: float
 
 
 def generate_synthetic_sar_scene(

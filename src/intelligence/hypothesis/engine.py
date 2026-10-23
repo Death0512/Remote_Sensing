@@ -18,6 +18,8 @@ from src.domain.evidence import Evidence
 from src.domain.hypothesis import Hypothesis
 from src.domain.provenance import Provenance
 from src.intelligence.accumulator import EvidenceAccumulator
+from src.intelligence.calibration.calibrator import ProbabilityCalibrator
+from src.provenance.engine import compute_bytes_checksum, get_git_commit
 
 
 class HypothesisEngine:
@@ -25,11 +27,13 @@ class HypothesisEngine:
 
     def __init__(
         self,
-        pipeline_version: str = "2.0.0",
-        git_commit: str = "30d2bc8",
+        calibrator: Optional[ProbabilityCalibrator] = None,
+        pipeline_version: str = "3.0.0",
+        git_commit: Optional[str] = None,
     ) -> None:
+        self.calibrator = calibrator
         self.pipeline_version = pipeline_version
-        self.git_commit = git_commit
+        self.git_commit = git_commit or get_git_commit()
 
     def _create_provenance(
         self,
@@ -59,7 +63,7 @@ class HypothesisEngine:
             acquisition_metadata_ref=metadata_ref,
             pipeline_version=self.pipeline_version,
             git_commit=self.git_commit,
-            config_hash="hypothesis-engine-v2",
+            config_hash=compute_bytes_checksum(b"hypothesis-engine-v3"),
             model_id=None,
             model_version=None,
             input_checksum=input_hash,
@@ -77,6 +81,7 @@ class HypothesisEngine:
         refuting: Sequence[Evidence],
         score: float,
         calibration_state: CalibrationState,
+        calibrated_probability: Optional[float] = None,
     ) -> tuple[str, str]:
         primary_explanation = f"{statement.value}: {primary_summary}"
 
@@ -120,13 +125,13 @@ class HypothesisEngine:
         else:
             lines.append("Refuting Evidence: none observed.")
 
-        if calibration_state == CalibrationState.NOT_CALIBRATED:
+        if calibration_state == CalibrationState.NOT_CALIBRATED or calibrated_probability is None:
             lines.append(
                 f"Calibration: Calibrated probability unavailable; heuristic/model raw score: {score:.2f}"
             )
         else:
             lines.append(
-                f"Calibration: State={calibration_state.value}, Score={score:.2f}"
+                f"Calibration: State={calibration_state.value}, Probability={calibrated_probability:.4f}, RawScore={score:.2f}"
             )
 
         detailed_rationale = "\n".join(lines)
@@ -144,6 +149,15 @@ class HypothesisEngine:
             weight = max(min(ev.quality, 1.0), 0.1)
             scores.append(normalized_val * weight)
         return round(sum(scores) / len(scores), 2)
+
+    def _resolve_calibration(
+        self, raw_score: float
+    ) -> tuple[CalibrationState, Optional[float]]:
+        if self.calibrator is not None:
+            cal_state = self.calibrator.calibration_state
+            cal_prob = self.calibrator.calibrate(raw_score)
+            return cal_state, cal_prob
+        return CalibrationState.NOT_CALIBRATED, None
 
     def evaluate(
         self,
@@ -248,11 +262,16 @@ class HypothesisEngine:
         elif ais_ev.supports in (
             AisCorrelationState.NO_MATCH.value,
             "NO_MATCH",
+            "AIS_NO_MATCH_WITHIN_VERIFIED_COVERAGE",
         ):
             is_active_feed = not any(
                 "feed_active=False" in ref for ref in ais_ev.references
             )
-            if is_active_feed:
+            has_verified_coverage = any(
+                "coverage=VERIFIED" in ref or "COVERAGE_VERIFIED" in ref
+                for ref in ais_ev.references
+            )
+            if is_active_feed and has_verified_coverage:
                 statement = HypothesisStatement.DARK_VESSEL_TRANSITING
                 supporting = (maritime_det, ais_ev, *spatial_evs)
                 refuting = ()
@@ -265,7 +284,7 @@ class HypothesisEngine:
                 supporting = (maritime_det, *spatial_evs)
                 refuting = (ais_ev,)
                 primary_reason = (
-                    "AIS feed is inactive in target sector. "
+                    "AIS feed is inactive or unverified receiver coverage in target sector. "
                     "Unverified surface target pending restored AIS telemetry."
                 )
         elif ais_ev.supports in (
@@ -303,7 +322,7 @@ class HypothesisEngine:
             )
 
         score = self._compute_score(supporting)
-        calibration_state = CalibrationState.NOT_CALIBRATED
+        calibration_state, calibrated_prob = self._resolve_calibration(score)
         primary_expl, detailed_rat = self._build_explanations(
             statement,
             primary_reason,
@@ -311,6 +330,7 @@ class HypothesisEngine:
             refuting,
             score,
             calibration_state,
+            calibrated_prob,
         )
 
         all_ids = tuple(
@@ -325,6 +345,8 @@ class HypothesisEngine:
             supporting_evidence=tuple(supporting),
             refuting_evidence=tuple(refuting),
             score=score,
+            raw_score=score,
+            calibrated_probability=calibrated_prob,
             score_method=ScoreMethod.RULE_ENGINE,
             calibration_state=calibration_state,
             explanation=primary_expl,
@@ -417,7 +439,7 @@ class HypothesisEngine:
 
         refuting: list[Evidence] = []
         score = self._compute_score(supporting)
-        calibration_state = CalibrationState.NOT_CALIBRATED
+        calibration_state, calibrated_prob = self._resolve_calibration(score)
         primary_reason = (
             f"Optical/parallax candidate detected with high estimated velocity "
             f"({kin_ev.value:.1f}) traversing territorial airspace ({zone_name})."
@@ -430,6 +452,7 @@ class HypothesisEngine:
             refuting,
             score,
             calibration_state,
+            calibrated_prob,
         )
         all_ids = tuple(
             e.evidence_id for e in list(supporting) + list(refuting)
@@ -443,6 +466,8 @@ class HypothesisEngine:
             supporting_evidence=tuple(supporting),
             refuting_evidence=tuple(refuting),
             score=score,
+            raw_score=score,
+            calibrated_probability=calibrated_prob,
             score_method=ScoreMethod.RULE_ENGINE,
             calibration_state=calibration_state,
             explanation=primary_expl,
@@ -492,7 +517,7 @@ class HypothesisEngine:
         supporting = (chg_ev, corrob_ev)
         refuting: list[Evidence] = []
         score = self._compute_score(supporting)
-        calibration_state = CalibrationState.NOT_CALIBRATED
+        calibration_state, calibrated_prob = self._resolve_calibration(score)
         primary_reason = (
             "Bitemporal change detection with high-tier co-registration residual (<= 0.5px) "
             "corroborated by surface sensor confirmation."
@@ -505,6 +530,7 @@ class HypothesisEngine:
             refuting,
             score,
             calibration_state,
+            calibrated_prob,
         )
         all_ids = tuple(
             e.evidence_id for e in list(supporting) + list(refuting)
@@ -518,6 +544,8 @@ class HypothesisEngine:
             supporting_evidence=tuple(supporting),
             refuting_evidence=tuple(refuting),
             score=score,
+            raw_score=score,
+            calibrated_probability=calibrated_prob,
             score_method=ScoreMethod.RULE_ENGINE,
             calibration_state=calibration_state,
             explanation=primary_expl,
@@ -538,7 +566,7 @@ class HypothesisEngine:
         supporting = (obj_ev,)
         refuting: list[Evidence] = []
         score = self._compute_score(supporting)
-        calibration_state = CalibrationState.NOT_CALIBRATED
+        calibration_state, calibrated_prob = self._resolve_calibration(score)
         primary_reason = (
             "Isolated surface object detected without multi-sensor corroboration or auxiliary telemetry."
         )
@@ -550,6 +578,7 @@ class HypothesisEngine:
             refuting,
             score,
             calibration_state,
+            calibrated_prob,
         )
         all_ids = tuple(
             e.evidence_id for e in list(supporting) + list(refuting)
@@ -563,6 +592,8 @@ class HypothesisEngine:
             supporting_evidence=tuple(supporting),
             refuting_evidence=tuple(refuting),
             score=score,
+            raw_score=score,
+            calibrated_probability=calibrated_prob,
             score_method=ScoreMethod.RULE_ENGINE,
             calibration_state=calibration_state,
             explanation=primary_expl,

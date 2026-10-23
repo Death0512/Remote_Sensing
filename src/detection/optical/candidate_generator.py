@@ -9,6 +9,7 @@ from shapely.geometry import Point
 
 from src.domain.candidate import Candidate
 from src.domain.enums import Capability
+from src.domain.geometry import AxisAlignedBoundingBox
 from src.domain.observation import ProcessedObservation
 from src.domain.provenance import Provenance
 
@@ -67,12 +68,13 @@ class HeuristicBrightBlobCandidateGenerator:
             max_row = int(np.max(coords[:, 0]))
             min_col = int(np.min(coords[:, 1]))
             max_col = int(np.max(coords[:, 1]))
-            geom_px = (
-                float(min_col),
-                float(min_row),
-                float(max_col),
-                float(max_row),
+            aabb = AxisAlignedBoundingBox(
+                min_col=float(min_col),
+                min_row=float(min_row),
+                max_col=float(max_col),
+                max_row=float(max_row),
             )
+            geom_px = aabb.to_tuple()
 
             c_row = float(np.mean(coords[:, 0]))
             c_col = float(np.mean(coords[:, 1]))
@@ -155,7 +157,7 @@ class HeuristicBrightBlobCandidateGenerator:
                 provenance_id=f"prov-cand-{uuid4().hex[:12]}",
                 source_asset_id=src_asset,
                 acquisition_metadata_ref=meta_ref,
-                pipeline_version="2.0.0",
+                pipeline_version="3.0.0",
                 git_commit=(
                     processed_observation.provenance.git_commit
                     if processed_observation
@@ -202,6 +204,7 @@ class HeuristicBrightBlobCandidateGenerator:
                     features=features,
                     quality_flags=(),
                     provenance=cand_prov,
+                    bounding_box=aabb,
                 )
             )
 

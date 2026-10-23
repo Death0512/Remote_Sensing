@@ -4,16 +4,20 @@ from typing import Optional
 from uuid import uuid4
 import numpy as np
 
-from src.domain.enums import Capability, GeometricState, QualityTier, RadiometricState
+from src.domain.enums import Capability, GeometricState, GeometryStatus, QualityTier, RadiometricState
 from src.domain.observation import Observation, ProcessedObservation
 from src.domain.provenance import Provenance
+from src.preprocessing.calibration.optical import OpticalCalibrator
+from src.preprocessing.masking.scl import SclMaskExtractor
 
 
 class OpticalPreprocessor:
     capability: Capability = Capability.IMPLEMENTED
 
-    def __init__(self, default_cloud_threshold: float = 0.30) -> None:
+    def __init__(self, default_cloud_threshold: float = 0.20) -> None:
         self.default_cloud_threshold = default_cloud_threshold
+        self.calibrator = OpticalCalibrator()
+        self.scl_extractor = SclMaskExtractor(cloud_threshold=default_cloud_threshold)
 
     def normalize(
         self,
@@ -34,6 +38,7 @@ class OpticalPreprocessor:
         self,
         observation: Observation,
         cloud_mask: Optional[np.ndarray] = None,
+        scl_data: Optional[np.ndarray] = None,
         cloud_threshold: Optional[float] = None,
     ) -> ProcessedObservation:
         threshold = (
@@ -43,11 +48,26 @@ class OpticalPreprocessor:
         )
 
         cloud_fraction = 0.0
-        if cloud_mask is not None:
+        masks = []
+        is_cloud_exceeded = False
+
+        if scl_data is not None:
+            tier, fraction, stats = self.scl_extractor.evaluate_quality(
+                scl=scl_data,
+                cloud_threshold=threshold,
+                include_shadows=True,
+            )
+            cloud_fraction = fraction
+            if tier == QualityTier.CLOUD_CONTAMINATED:
+                is_cloud_exceeded = True
+            masks.append(("scl_cloud_mask", f"contamination_ratio_{fraction:.3f}"))
+        elif cloud_mask is not None:
             cloud_fraction = self.compute_cloud_fraction(cloud_mask)
+            if cloud_fraction > threshold:
+                is_cloud_exceeded = True
+            masks.append(("cloud_mask", f"cloud_fraction_{cloud_fraction:.3f}"))
 
         is_flagged_cloudy = "CLOUD_CONTAMINATED" in observation.quality_flags
-        is_cloud_exceeded = cloud_fraction > threshold
 
         if is_flagged_cloudy or is_cloud_exceeded:
             quality_tier = QualityTier.CLOUD_CONTAMINATED
@@ -58,28 +78,36 @@ class OpticalPreprocessor:
         else:
             quality_tier = QualityTier.DATA_OK
 
+        proc_level = observation.processing_level.upper().strip()
         if (
+            "SURFACE_REFLECTANCE" in observation.quality_flags
+            or proc_level in {"L2A", "BOA", "SURFACE_REFLECTANCE"}
+        ):
+            radiometric_state = RadiometricState.SURFACE_REFLECTANCE
+        elif (
             "TOA_REFLECTANCE" in observation.quality_flags
-            or observation.processing_level in {"L1C", "L2A", "TOA", "BOA"}
+            or proc_level in {"L1C", "TOA", "TOA_REFLECTANCE"}
         ):
             radiometric_state = RadiometricState.TOA_REFLECTANCE
         else:
             radiometric_state = RadiometricState.RAW
 
-        if observation.processing_level in {"L2A", "ORTHO"}:
+        if proc_level in {"L2A", "ORTHO"}:
             geometric_state = GeometricState.TERRAIN_CORRECTED
         else:
             geometric_state = GeometricState.GEOCODED
 
-        masks = []
-        if cloud_mask is not None:
-            masks.append(("cloud_mask", f"cloud_fraction_{cloud_fraction:.3f}"))
+        geom_status = (
+            observation.geometry_status
+            if hasattr(observation, "geometry_status")
+            else GeometryStatus.GEOCODED
+        )
 
         proc_prov = Provenance(
             provenance_id=f"prov-proc-opt-{uuid4().hex[:12]}",
             source_asset_id=observation.provenance.source_asset_id,
             acquisition_metadata_ref=observation.metadata_uri,
-            pipeline_version="2.0.0",
+            pipeline_version="3.0.0",
             git_commit=observation.provenance.git_commit,
             config_hash=observation.provenance.config_hash,
             model_id=None,
@@ -102,4 +130,6 @@ class OpticalPreprocessor:
             masks=tuple(masks),
             quality_tier=quality_tier,
             provenance=proc_prov,
+            geometry_status=geom_status,
+            geometry=observation.geometry,
         )

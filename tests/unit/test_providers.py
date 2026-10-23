@@ -108,7 +108,9 @@ def test_status_endpoint_returns_live_provider_health(tmp_path: Path) -> None:
         with TestClient(app) as client:
             resp = client.get("/api/status")
             assert resp.status_code == 200
-            data = resp.json()
+            res = resp.json()
+            assert res["status"] == "SUCCESS"
+            data = res["data"]
             assert "status" in data
             assert data["status"] in ("OPERATIONAL", "DEGRADED")
             assert "providers" in data
@@ -153,7 +155,9 @@ def test_status_endpoint_degraded_when_provider_fails(tmp_path: Path) -> None:
         with TestClient(app) as client:
             resp = client.get("/api/status")
             assert resp.status_code == 200
-            data = resp.json()
+            res = resp.json()
+            assert res["status"] == "SUCCESS"
+            data = res["data"]
             assert data["status"] == "DEGRADED"
             assert data["services"]["planetary_computer"] == "DOWN"
             assert data["services"]["cdse_copernicus"] == "DOWN"

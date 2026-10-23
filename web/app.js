@@ -1,3 +1,43 @@
+function escapeHtml(str) {
+    if (str === null || str === undefined) return "";
+    return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+let inMemoryAuthToken = "";
+function getStoredToken() {
+    if (inMemoryAuthToken) return inMemoryAuthToken;
+    try {
+        if (typeof sessionStorage !== "undefined") {
+            const token = sessionStorage.getItem("tactical_token");
+            if (token) {
+                inMemoryAuthToken = token;
+                return token;
+            }
+        }
+    } catch (e) {
+    }
+    return "";
+}
+
+function setStoredToken(token) {
+    inMemoryAuthToken = token || "";
+    try {
+        if (typeof sessionStorage !== "undefined") {
+            if (token) {
+                sessionStorage.setItem("tactical_token", token);
+            } else {
+                sessionStorage.removeItem("tactical_token");
+            }
+        }
+    } catch (e) {
+    }
+}
+
 let map = null;
 let alertsData = [];
 let markersMap = {};
@@ -7,6 +47,7 @@ let isDrawingAoi = false;
 let drawStart = null;
 let currentDate = "2026-10-22";
 let currentChipTab = "preview";
+let currentAuthToken = getStoredToken();
 
 const BASE_TIMESTAMP = Date.UTC(2024, 0, 1);
 const MAX_DAYS = 1025;
@@ -50,14 +91,92 @@ const PRESETS = {
     }
 };
 
-document.addEventListener("DOMContentLoaded", () => {
-    initMap();
-    setupFilters();
-    setupLayerSwitcher();
-    setupTimeline();
-    setupScanner();
-    setInterval(fetchAlerts, 10000);
-});
+if (typeof document !== "undefined") {
+    document.addEventListener("DOMContentLoaded", () => {
+        setupAuth();
+        initMap();
+        setupFilters();
+        setupLayerSwitcher();
+        setupTimeline();
+        setupScanner();
+        setupDelegatedEvents();
+        setInterval(fetchAlerts, 10000);
+    });
+}
+
+async function setupAuth() {
+    const usernameInput = document.getElementById("auth-username");
+    const passwordInput = document.getElementById("auth-password");
+    const loginBtn = document.getElementById("auth-login-btn");
+    const indicator = document.getElementById("auth-status-indicator");
+
+    async function loginWithCredentials(username, password) {
+        if (!username || !password) return;
+        try {
+            const resp = await fetch("/api/auth/token", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ username, password })
+            });
+            if (resp.ok) {
+                const res = await resp.json();
+                const payload = res.data || res;
+                currentAuthToken = payload.access_token;
+                setStoredToken(currentAuthToken);
+                const role = (payload.user && payload.user.role) ? payload.user.role.toUpperCase() : "AUTHENTICATED";
+                if (indicator) {
+                    indicator.textContent = `AUTHENTICATED (${role})`;
+                    indicator.style.color = "var(--accent-green)";
+                }
+                if (passwordInput) passwordInput.value = "";
+                await fetchAlerts();
+            } else {
+                if (indicator) {
+                    indicator.textContent = "AUTH FAILED";
+                    indicator.style.color = "var(--accent-red)";
+                }
+            }
+        } catch (e) {
+            if (indicator) {
+                indicator.textContent = "AUTH ERROR";
+                indicator.style.color = "var(--accent-red)";
+            }
+        }
+    }
+
+    if (loginBtn) {
+        loginBtn.addEventListener("click", () => {
+            const u = usernameInput ? usernameInput.value.trim() : "";
+            const p = passwordInput ? passwordInput.value : "";
+            loginWithCredentials(u, p);
+        });
+    }
+
+    if (passwordInput) {
+        passwordInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") {
+                const u = usernameInput ? usernameInput.value.trim() : "";
+                const p = passwordInput ? passwordInput.value : "";
+                loginWithCredentials(u, p);
+            }
+        });
+    }
+
+    const existingToken = getStoredToken();
+    if (existingToken && indicator) {
+        indicator.textContent = "AUTHENTICATED";
+        indicator.style.color = "var(--accent-green)";
+    }
+}
+
+function getAuthHeaders() {
+    const headers = { "Content-Type": "application/json" };
+    const token = inMemoryAuthToken || currentAuthToken || getStoredToken();
+    if (token) {
+        headers["Authorization"] = `Bearer ${token}`;
+    }
+    return headers;
+}
 
 function getGibsUrl(dateStr) {
     return `https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${dateStr}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`;
@@ -118,65 +237,35 @@ function initMap() {
             }
         },
         layers: [
-            {
-                id: "layer-carto-dark",
-                type: "raster",
-                source: "carto-dark",
-                layout: { visibility: "none" }
-            },
-            {
-                id: "layer-esri-satellite",
-                type: "raster",
-                source: "esri-satellite",
-                layout: { visibility: "visible" }
-            },
-            {
-                id: "layer-opentopo",
-                type: "raster",
-                source: "opentopo",
-                layout: { visibility: "none" }
-            },
-            {
-                id: "layer-arcgis-ocean",
-                type: "raster",
-                source: "arcgis-ocean",
-                layout: { visibility: "none" }
-            },
-            {
-                id: "layer-nasa-gibs",
-                type: "raster",
-                source: "nasa-gibs",
-                layout: { visibility: "none" }
-            },
-            {
-                id: "layer-openseamap",
-                type: "raster",
-                source: "openseamap",
-                layout: { visibility: "visible" }
-            }
+            { id: "layer-carto-dark", type: "raster", source: "carto-dark", layout: { visibility: "none" } },
+            { id: "layer-arcgis-ocean", type: "raster", source: "arcgis-ocean", layout: { visibility: "none" } },
+            { id: "layer-opentopo", type: "raster", source: "opentopo", layout: { visibility: "none" } },
+            { id: "layer-esri-satellite", type: "raster", source: "esri-satellite", layout: { visibility: "visible" } },
+            { id: "layer-nasa-gibs", type: "raster", source: "nasa-gibs", layout: { visibility: "none" } },
+            { id: "layer-openseamap", type: "raster", source: "openseamap", layout: { visibility: "visible" } }
         ]
     };
 
     map = new maplibregl.Map({
         container: "map",
         style: styleObj,
-        center: [108.0, 16.0],
-        zoom: 5
+        center: [111.5, 12.0],
+        zoom: 5.5,
+        attributionControl: false
     });
 
     map.addControl(new maplibregl.NavigationControl(), "top-right");
+    map.addControl(new maplibregl.ScaleControl({ maxWidth: 200, unit: "metric" }), "bottom-right");
 
     map.on("load", () => {
-        initAoiBoxLayer();
         fetchZones();
         fetchAlerts();
+        initAoiDrawLayers();
     });
 }
 
-function initAoiBoxLayer() {
-    if (map.getSource("aoi-box")) return;
-
-    map.addSource("aoi-box", {
+function initAoiDrawLayers() {
+    map.addSource("aoi-draw", {
         type: "geojson",
         data: {
             type: "FeatureCollection",
@@ -185,9 +274,9 @@ function initAoiBoxLayer() {
     });
 
     map.addLayer({
-        id: "aoi-box-fill",
+        id: "aoi-draw-fill",
         type: "fill",
-        source: "aoi-box",
+        source: "aoi-draw",
         paint: {
             "fill-color": "#06b6d4",
             "fill-opacity": 0.15
@@ -195,49 +284,163 @@ function initAoiBoxLayer() {
     });
 
     map.addLayer({
-        id: "aoi-box-line",
+        id: "aoi-draw-line",
         type: "line",
-        source: "aoi-box",
+        source: "aoi-draw",
         paint: {
-            "line-color": "#22d3ee",
+            "line-color": "#06b6d4",
             "line-width": 2,
-            "line-dasharray": [2, 2]
+            "line-dasharray": [3, 2]
         }
     });
 }
 
-function updateAoiBoxGeojson(bbox) {
-    if (!map || !map.getSource("aoi-box")) return;
-    if (!bbox) {
-        clearAoiBoxGeojson();
-        return;
-    }
-    const [minX, minY, maxX, maxY] = bbox;
-    const feature = {
-        type: "Feature",
-        geometry: {
-            type: "Polygon",
-            coordinates: [[
-                [minX, minY],
-                [maxX, minY],
-                [maxX, maxY],
-                [minX, maxY],
-                [minX, minY]
-            ]]
-        }
+function setAoiBox(bbox) {
+    activeBbox = bbox;
+    const [w, s, e, n] = bbox;
+    const geom = {
+        type: "Polygon",
+        coordinates: [[
+            [w, n],
+            [e, n],
+            [e, s],
+            [w, s],
+            [w, n]
+        ]]
     };
-    map.getSource("aoi-box").setData({
-        type: "FeatureCollection",
-        features: [feature]
-    });
+    if (map.getSource("aoi-draw")) {
+        map.getSource("aoi-draw").setData({
+            type: "FeatureCollection",
+            features: [{ type: "Feature", properties: {}, geometry: geom }]
+        });
+    }
 }
 
-function clearAoiBoxGeojson() {
-    if (!map || !map.getSource("aoi-box")) return;
-    map.getSource("aoi-box").setData({
-        type: "FeatureCollection",
-        features: []
+function setupScanner() {
+    const presetSelect = document.getElementById("scan-preset");
+    if (presetSelect) {
+        presetSelect.addEventListener("change", (e) => {
+            const key = e.target.value;
+            if (key === "none") {
+                activeBbox = null;
+                if (map.getSource("aoi-draw")) {
+                    map.getSource("aoi-draw").setData({ type: "FeatureCollection", features: [] });
+                }
+                updateScanStatus("Preset cleared. Ready to scan current view.");
+                return;
+            }
+            const preset = PRESETS[key];
+            if (preset) {
+                map.flyTo({ center: preset.center, zoom: preset.zoom });
+                setAoiBox(preset.bbox);
+                updateScanStatus(`Preset selected: ${preset.name}`);
+            }
+        });
+    }
+
+    const drawBtn = document.getElementById("btn-draw-aoi");
+    if (drawBtn) {
+        drawBtn.addEventListener("click", () => {
+            isDrawingAoi = !isDrawingAoi;
+            if (isDrawingAoi) {
+                drawBtn.classList.add("active");
+                drawBtn.textContent = "CLICK & DRAG AOI";
+                map.getCanvas().style.cursor = "crosshair";
+                map.dragPan.disable();
+            } else {
+                drawBtn.classList.remove("active");
+                drawBtn.textContent = "DRAW AOI BOX";
+                map.getCanvas().style.cursor = "";
+                map.dragPan.enable();
+            }
+        });
+    }
+
+    map.on("mousedown", (e) => {
+        if (!isDrawingAoi) return;
+        drawStart = [e.lngLat.lng, e.lngLat.lat];
     });
+
+    map.on("mousemove", (e) => {
+        if (!isDrawingAoi || !drawStart) return;
+        const current = [e.lngLat.lng, e.lngLat.lat];
+        const minX = Math.min(drawStart[0], current[0]);
+        const maxX = Math.max(drawStart[0], current[0]);
+        const minY = Math.min(drawStart[1], current[1]);
+        const maxY = Math.max(drawStart[1], current[1]);
+        setAoiBox([minX, minY, maxX, maxY]);
+    });
+
+    map.on("mouseup", (e) => {
+        if (!isDrawingAoi || !drawStart) return;
+        const current = [e.lngLat.lng, e.lngLat.lat];
+        const minX = Math.min(drawStart[0], current[0]);
+        const maxX = Math.max(drawStart[0], current[0]);
+        const minY = Math.min(drawStart[1], current[1]);
+        const maxY = Math.max(drawStart[1], current[1]);
+        if (Math.abs(maxX - minX) > 0.005 && Math.abs(maxY - minY) > 0.005) {
+            setAoiBox([minX, minY, maxX, maxY]);
+            updateScanStatus(`AOI Box: [${minX.toFixed(3)}, ${minY.toFixed(3)}, ${maxX.toFixed(3)}, ${maxY.toFixed(3)}]`);
+            if (presetSelect) presetSelect.value = "none";
+        }
+        isDrawingAoi = false;
+        drawStart = null;
+        drawBtn.classList.remove("active");
+        drawBtn.textContent = "DRAW AOI BOX";
+        map.getCanvas().style.cursor = "";
+        map.dragPan.enable();
+    });
+
+    document.getElementById("btn-scan-aoi")?.addEventListener("click", triggerAoiScan);
+}
+
+function updateScanStatus(msg) {
+    const el = document.getElementById("scan-status");
+    if (el) el.textContent = msg;
+}
+
+async function triggerAoiScan() {
+    let bbox = activeBbox;
+    if (!bbox) {
+        const bounds = map.getBounds();
+        bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+    }
+
+    const source = document.getElementById("scan-source").value;
+    const date = currentDate;
+    const scanBtn = document.getElementById("btn-scan-aoi");
+    if (scanBtn) {
+        scanBtn.classList.add("scanning");
+        scanBtn.disabled = true;
+    }
+    updateScanStatus(`Scanning ${source.toUpperCase()} tiles: [${bbox[0].toFixed(2)}, ${bbox[1].toFixed(2)}, ${bbox[2].toFixed(2)}, ${bbox[3].toFixed(2)}]...`);
+
+    try {
+        const resp = await fetch("/api/scan-map-aoi", {
+            method: "POST",
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ bbox, source, date })
+        });
+        const resJson = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            const errMsg = resJson.errors && resJson.errors.length > 0 ? resJson.errors[0].message : (resJson.detail || resp.statusText);
+            updateScanStatus(`Scan failed: ${errMsg}`);
+            return;
+        }
+        const data = resJson.data || resJson;
+        updateScanStatus(`Scan complete: ${data.detections_count} contacts detected across ${data.tiles_fetched} tiles.`);
+        await fetchAlerts();
+        if (data.alerts && data.alerts.length > 0) {
+            selectAlert(data.alerts[0].alert_id);
+        }
+    } catch (err) {
+        updateScanStatus(`Scan error: ${err.message}`);
+    } finally {
+        if (scanBtn) {
+            scanBtn.classList.remove("scanning");
+            scanBtn.disabled = false;
+        }
+    }
 }
 
 function setupLayerSwitcher() {
@@ -345,160 +548,37 @@ function setupTimeline() {
         });
     }
 
-    document.getElementById("btn-time-prev7")?.addEventListener("click", () => {
-        const cur = offsetFromDate(currentDate);
-        applyDate(dateFromOffset(Math.max(0, cur - 7)));
-    });
-
-    document.getElementById("btn-time-prev1")?.addEventListener("click", () => {
-        const cur = offsetFromDate(currentDate);
-        applyDate(dateFromOffset(Math.max(0, cur - 1)));
-    });
-
-    document.getElementById("btn-time-next1")?.addEventListener("click", () => {
-        const cur = offsetFromDate(currentDate);
-        applyDate(dateFromOffset(Math.min(MAX_DAYS, cur + 1)));
-    });
-
-    document.getElementById("btn-time-next7")?.addEventListener("click", () => {
-        const cur = offsetFromDate(currentDate);
-        applyDate(dateFromOffset(Math.min(MAX_DAYS, cur + 7)));
-    });
-
     document.getElementById("btn-time-today")?.addEventListener("click", () => {
         applyDate("2026-10-22");
     });
-}
 
-function updateScanStatus(msg) {
-    const el = document.getElementById("scan-status");
-    if (el) el.textContent = msg;
-}
-
-function setupScanner() {
-    const presetSelect = document.getElementById("scan-preset");
-    presetSelect?.addEventListener("change", (e) => {
-        const key = e.target.value;
-        if (key === "none") {
-            activeBbox = null;
-            clearAoiBoxGeojson();
-            updateScanStatus("Current map viewport will be scanned.");
-            return;
-        }
-        const preset = PRESETS[key];
-        if (preset) {
-            activeBbox = [...preset.bbox];
-            map.flyTo({ center: preset.center, zoom: preset.zoom });
-            updateAoiBoxGeojson(activeBbox);
-            updateScanStatus(`Preset selected: ${preset.name}`);
-        }
+    document.getElementById("btn-time-prev1")?.addEventListener("click", () => {
+        const off = Math.max(0, offsetFromDate(currentDate) - 1);
+        applyDate(dateFromOffset(off));
     });
 
-    const drawBtn = document.getElementById("btn-draw-aoi");
-    drawBtn?.addEventListener("click", () => {
-        isDrawingAoi = !isDrawingAoi;
-        if (isDrawingAoi) {
-            drawBtn.classList.add("active");
-            drawBtn.textContent = "CANCEL DRAW";
-            map.getCanvas().style.cursor = "crosshair";
-            map.dragPan.disable();
-            updateScanStatus("Click and drag on map to define custom AOI.");
-        } else {
-            drawBtn.classList.remove("active");
-            drawBtn.textContent = "DRAW AOI BOX";
-            map.getCanvas().style.cursor = "";
-            map.dragPan.enable();
-            drawStart = null;
-        }
+    document.getElementById("btn-time-next1")?.addEventListener("click", () => {
+        const off = Math.min(MAX_DAYS, offsetFromDate(currentDate) + 1);
+        applyDate(dateFromOffset(off));
     });
 
-    map.on("mousedown", (e) => {
-        if (!isDrawingAoi) return;
-        drawStart = [e.lngLat.lng, e.lngLat.lat];
+    document.getElementById("btn-time-prev7")?.addEventListener("click", () => {
+        const off = Math.max(0, offsetFromDate(currentDate) - 7);
+        applyDate(dateFromOffset(off));
     });
 
-    map.on("mousemove", (e) => {
-        if (!isDrawingAoi || !drawStart) return;
-        const cur = [e.lngLat.lng, e.lngLat.lat];
-        const minX = Math.min(drawStart[0], cur[0]);
-        const maxX = Math.max(drawStart[0], cur[0]);
-        const minY = Math.min(drawStart[1], cur[1]);
-        const maxY = Math.max(drawStart[1], cur[1]);
-        updateAoiBoxGeojson([minX, minY, maxX, maxY]);
+    document.getElementById("btn-time-next7")?.addEventListener("click", () => {
+        const off = Math.min(MAX_DAYS, offsetFromDate(currentDate) + 7);
+        applyDate(dateFromOffset(off));
     });
-
-    map.on("mouseup", (e) => {
-        if (!isDrawingAoi || !drawStart) return;
-        const cur = [e.lngLat.lng, e.lngLat.lat];
-        const minX = Math.min(drawStart[0], cur[0]);
-        const maxX = Math.max(drawStart[0], cur[0]);
-        const minY = Math.min(drawStart[1], cur[1]);
-        const maxY = Math.max(drawStart[1], cur[1]);
-        if (Math.abs(maxX - minX) > 0.005 && Math.abs(maxY - minY) > 0.005) {
-            activeBbox = [minX, minY, maxX, maxY];
-            updateAoiBoxGeojson(activeBbox);
-            updateScanStatus(`AOI Box: [${minX.toFixed(3)}, ${minY.toFixed(3)}, ${maxX.toFixed(3)}, ${maxY.toFixed(3)}]`);
-            if (presetSelect) presetSelect.value = "none";
-        }
-        isDrawingAoi = false;
-        drawStart = null;
-        drawBtn.classList.remove("active");
-        drawBtn.textContent = "DRAW AOI BOX";
-        map.getCanvas().style.cursor = "";
-        map.dragPan.enable();
-    });
-
-    document.getElementById("btn-scan-aoi")?.addEventListener("click", triggerAoiScan);
-}
-
-async function triggerAoiScan() {
-    let bbox = activeBbox;
-    if (!bbox) {
-        const bounds = map.getBounds();
-        bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
-    }
-
-    const source = document.getElementById("scan-source").value;
-    const date = currentDate;
-    const scanBtn = document.getElementById("btn-scan-aoi");
-    if (scanBtn) {
-        scanBtn.classList.add("scanning");
-        scanBtn.disabled = true;
-    }
-    updateScanStatus(`Scanning ${source.toUpperCase()} tiles: [${bbox[0].toFixed(2)}, ${bbox[1].toFixed(2)}, ${bbox[2].toFixed(2)}, ${bbox[3].toFixed(2)}]...`);
-
-    try {
-        const resp = await fetch("/api/scan-map-aoi", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ bbox, source, date })
-        });
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            updateScanStatus(`Scan failed: ${err.detail || resp.statusText}`);
-            return;
-        }
-        const data = await resp.json();
-        updateScanStatus(`Scan complete: ${data.detections_count} contacts detected across ${data.tiles_fetched} tiles.`);
-        await fetchAlerts();
-        if (data.alerts && data.alerts.length > 0) {
-            selectAlert(data.alerts[0].alert_id);
-        }
-    } catch (err) {
-        updateScanStatus(`Scan error: ${err.message}`);
-    } finally {
-        if (scanBtn) {
-            scanBtn.classList.remove("scanning");
-            scanBtn.disabled = false;
-        }
-    }
 }
 
 async function fetchZones() {
     try {
-        const resp = await fetch("/api/zones");
+        const resp = await fetch("/api/zones", { headers: getAuthHeaders() });
         if (!resp.ok) return;
-        const geojson = await resp.json();
+        const resJson = await resp.json();
+        const geojson = resJson.data || resJson;
 
         if (map.getSource("zones")) {
             map.getSource("zones").setData(geojson);
@@ -555,8 +635,8 @@ async function fetchZones() {
             map.getCanvas().style.cursor = "pointer";
             if (!e.features || !e.features.length) return;
             const props = e.features[0].properties || {};
-            const name = props.name || "Surveillance Zone";
-            const radius = props.max_radius_km ? ` (${props.max_radius_km} km)` : "";
+            const name = escapeHtml(props.name || "Surveillance Zone");
+            const radius = props.max_radius_km ? ` (${escapeHtml(props.max_radius_km)} km)` : "";
             popup.setLngLat(e.lngLat).setHTML(`<strong>${name}</strong>${radius}`).addTo(map);
         });
 
@@ -579,9 +659,10 @@ async function fetchAlerts() {
     if (statusFilter !== "ALL") params.append("status", statusFilter);
 
     try {
-        const resp = await fetch(`/api/alerts?${params.toString()}`);
+        const resp = await fetch(`/api/alerts?${params.toString()}`, { headers: getAuthHeaders() });
         if (!resp.ok) return;
-        alertsData = await resp.json();
+        const resJson = await resp.json();
+        alertsData = resJson.data !== undefined ? resJson.data : resJson;
         renderAlertList();
         renderMapMarkers();
         updateMetrics();
@@ -602,17 +683,24 @@ function renderAlertList() {
 
     alertsData.forEach(alert => {
         const item = document.createElement("div");
-        item.className = `alert-item level-${alert.level} ${alert.alert_id === selectedAlertId ? 'selected' : ''}`;
-        item.dataset.id = alert.alert_id;
+        const safeLevel = escapeHtml(alert.level || 'UNKNOWN');
+        const safeTarget = escapeHtml(alert.target_class || 'TARGET');
+        const safeStatus = escapeHtml(alert.status || 'PENDING');
+        const safeId = escapeHtml(alert.alert_id);
+        const safeZone = escapeHtml(alert.zone);
+        const scoreVal = (alert.score || 0).toFixed(1);
+
+        item.className = `alert-item level-${safeLevel} ${alert.alert_id === selectedAlertId ? 'selected' : ''}`;
+        item.dataset.id = safeId;
 
         item.innerHTML = `
             <div class="alert-item-header">
-                <span class="alert-target">${alert.target_class || 'TARGET'}</span>
-                <span class="badge badge-${alert.level}">${alert.level}</span>
+                <span class="alert-target">${safeTarget}</span>
+                <span class="badge badge-${safeLevel}">${safeLevel}</span>
             </div>
             <div class="alert-item-body">
-                <span>Zone ${alert.zone} | Score: ${(alert.score || 0).toFixed(1)}</span>
-                <span class="badge badge-${alert.status || 'PENDING'}">${alert.status || 'PENDING'}</span>
+                <span>Zone ${safeZone} | Score: ${scoreVal}</span>
+                <span class="badge badge-${safeStatus}">${safeStatus}</span>
             </div>
         `;
 
@@ -633,22 +721,29 @@ function renderMapMarkers() {
         const el = document.createElement("div");
         el.className = "custom-marker";
         const dot = document.createElement("div");
-        dot.className = `marker-dot ${alert.level}`;
+        dot.className = `marker-dot ${escapeHtml(alert.level)}`;
         el.appendChild(dot);
+
+        const safeTarget = escapeHtml(alert.target_class || 'TARGET');
+        const safeId = escapeHtml(alert.alert_id);
+        const safeLevel = escapeHtml(alert.level);
+        const safeStatus = escapeHtml(alert.status || 'PENDING');
+        const safeScore = (alert.score || 0).toFixed(1);
+        const alertIdJson = JSON.stringify(alert.alert_id || '');
 
         const popupContent = `
             <div style="font-size: 11px; color: #111; min-width: 140px;">
-                <strong>${alert.target_class || 'TARGET'}</strong><br/>
-                ID: ${alert.alert_id}<br/>
-                Severity: <b>${alert.level}</b> (Score: ${(alert.score || 0).toFixed(1)})<br/>
-                Status: <b>${alert.status || 'PENDING'}</b>
+                <strong>${safeTarget}</strong><br/>
+                ID: ${safeId}<br/>
+                Severity: <b>${safeLevel}</b> (Score: ${safeScore})<br/>
+                Status: <b>${safeStatus}</b>
                 <div style="margin-top: 6px;">
-                    <img src="/api/chips/${alert.alert_id}" style="width: 100%; height: 60px; object-fit: cover; border-radius: 2px; display: block; background: #000;" onerror="this.style.display='none'"/>
+                    <img src="/api/chips/${encodeURIComponent(alert.alert_id)}" style="width: 100%; height: 60px; object-fit: cover; border-radius: 2px; display: block; background: #000;" onerror="this.style.display='none'"/>
                 </div>
                 <div style="margin-top: 6px; display: flex; gap: 4px;">
-                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #dc2626; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="performAlertAction('${alert.alert_id}', 'CONFIRM')">CONFIRM</button>
-                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #475569; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="performAlertAction('${alert.alert_id}', 'DISMISS')">DISMISS</button>
-                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #d97706; color: #fff; border: none; border-radius: 2px; cursor: pointer;" onclick="performAlertAction('${alert.alert_id}', 'FLAG_UNCERTAIN')">UNCERTAIN</button>
+                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #dc2626; color: #fff; border: none; border-radius: 2px; cursor: pointer;" data-action="CONFIRM" data-alert-id="${safeId}">CONFIRM</button>
+                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #475569; color: #fff; border: none; border-radius: 2px; cursor: pointer;" data-action="DISMISS" data-alert-id="${safeId}">DISMISS</button>
+                    <button style="flex: 1; padding: 2px 4px; font-size: 9px; background: #d97706; color: #fff; border: none; border-radius: 2px; cursor: pointer;" data-action="FLAG_UNCERTAIN" data-alert-id="${safeId}">UNCERTAIN</button>
                 </div>
             </div>
         `;
@@ -697,22 +792,28 @@ function renderInspectionDrawer(alert) {
     const statusBadge = document.getElementById("inspect-status-badge");
     const st = alert.status || "PENDING";
     statusBadge.textContent = st;
-    statusBadge.className = `badge badge-${st}`;
+    statusBadge.className = `badge badge-${escapeHtml(st)}`;
 
     const drawerBody = document.getElementById("drawer-body");
-    const previewUrl = alert.chips?.preview || `/api/chips/${alert.alert_id}`;
-    const analysisUrl = alert.chips?.analysis || `/api/chips/${alert.alert_id}/analysis.tif`;
-    const rawUrl = alert.chips?.raw || `/api/chips/${alert.alert_id}/raw.tif`;
+    const previewUrl = alert.chips?.preview || `/api/chips/${encodeURIComponent(alert.alert_id)}`;
+    const analysisUrl = alert.chips?.analysis || `/api/chips/${encodeURIComponent(alert.alert_id)}/analysis.tif`;
+    const rawUrl = alert.chips?.raw || `/api/chips/${encodeURIComponent(alert.alert_id)}/raw.tif`;
+
+    const safeTarget = escapeHtml(alert.target_class || 'UNKNOWN');
+    const safeLevel = escapeHtml(alert.level || 'UNKNOWN');
+    const safeSensor = escapeHtml(alert.sensor || 'SAR');
+    const safeAlertId = escapeHtml(alert.alert_id);
+    const safeBundleUri = escapeHtml(alert.bundle_uri || `file://data/outputs/alert_${alert.alert_id}`);
 
     let chipViewHtml = "";
     if (currentChipTab === "preview") {
         chipViewHtml = `
-            <img class="chip-preview" src="${previewUrl}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'256\\' height=\\'256\\'><rect width=\\'256\\' height=\\'256\\' fill=\\'%23111\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%23666\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>CHIP PREVIEW</text></svg>'" alt="Chip preview"/>
+            <img class="chip-preview" src="${escapeHtml(previewUrl)}" onerror="this.src='data:image/svg+xml;utf8,<svg xmlns=\\'http://www.w3.org/2000/svg\\' width=\\'256\\' height=\\'256\\'><rect width=\\'256\\' height=\\'256\\' fill=\\'%23111\\'/><text x=\\'50%\\' y=\\'50%\\' fill=\\'%23666\\' dominant-baseline=\\'middle\\' text-anchor=\\'middle\\'>CHIP PREVIEW</text></svg>'" alt="Chip preview"/>
         `;
     } else if (currentChipTab === "analysis") {
         chipViewHtml = `
             <div class="chip-meta-box">
-URI: ${analysisUrl}
+URI: ${escapeHtml(analysisUrl)}
 Type: Float32 Normalized Tensor
 Channels: Single / Multiband
 Dynamic Range: [0.000, 1.000]
@@ -724,10 +825,10 @@ Status: Radiometrically Calibrated
     } else {
         chipViewHtml = `
             <div class="chip-meta-box">
-URI: ${rawUrl}
-Bundle: ${alert.bundle_uri || 'file://data/outputs/alert_' + alert.alert_id}
-Sensor: ${alert.sensor || 'SAR'}
-Target: ${alert.target_class || 'VESSEL'}
+URI: ${escapeHtml(rawUrl)}
+Bundle: ${safeBundleUri}
+Sensor: ${safeSensor}
+Target: ${safeTarget}
 Coordinates: ${alert.lat != null ? alert.lat.toFixed(5) : '0.00000'}°N, ${alert.lon != null ? alert.lon.toFixed(5) : '0.00000'}°E
 Format: 16-bit GeoTIFF / Raw Window
 Radiometry: Unaltered Digital Numbers (DN)
@@ -740,6 +841,15 @@ Lineage: Walk intact to source asset
     const conf = alert.confidence || {};
     const supp = alert.evidence?.supporting || [];
     const refut = alert.evidence?.refuting || [];
+    const prov = alert.provenance || {};
+
+    const safeStatement = escapeHtml(hyp.statement || 'UNVERIFIED_SURFACE_TARGET');
+    const safeExplanation = escapeHtml(hyp.primary_explanation || hyp.explanation || 'No primary explanation provided');
+    const safeRationale = escapeHtml(hyp.detailed_rationale || '');
+    const safeCalibState = escapeHtml(conf.calibration_state || 'NOT_CALIBRATED');
+    const safePipeline = escapeHtml(prov.pipeline_version || '3.0.0');
+    const safeAssetId = escapeHtml(prov.source_asset_id || ('ASSET_' + alert.alert_id));
+    const safeRunId = escapeHtml(prov.processing_run_id || 'live');
 
     const rawScoreDisplay = conf.raw_score != null ? conf.raw_score.toFixed(2) : (alert.score || 0).toFixed(2);
     const modelScoreDisplay = conf.model_score != null ? conf.model_score.toFixed(2) : 'N/A';
@@ -749,9 +859,9 @@ Lineage: Walk intact to source asset
 
     drawerBody.innerHTML = `
         <div class="chip-switcher">
-            <button class="chip-tab ${currentChipTab === 'preview' ? 'active' : ''}" onclick="setChipTab('preview')">Preview (8-bit)</button>
-            <button class="chip-tab ${currentChipTab === 'analysis' ? 'active' : ''}" onclick="setChipTab('analysis')">Analysis (Norm)</button>
-            <button class="chip-tab ${currentChipTab === 'raw' ? 'active' : ''}" onclick="setChipTab('raw')">Raw Metadata</button>
+            <button class="chip-tab ${currentChipTab === 'preview' ? 'active' : ''}" data-tab="preview">Preview (8-bit)</button>
+            <button class="chip-tab ${currentChipTab === 'analysis' ? 'active' : ''}" data-tab="analysis">Analysis (Norm)</button>
+            <button class="chip-tab ${currentChipTab === 'raw' ? 'active' : ''}" data-tab="raw">Raw Metadata</button>
         </div>
 
         ${chipViewHtml}
@@ -759,15 +869,15 @@ Lineage: Walk intact to source asset
         <div class="drawer-detail-grid">
             <div class="detail-cell">
                 <div class="detail-label">TARGET CLASS</div>
-                <div class="detail-val">${alert.target_class || 'UNKNOWN'}</div>
+                <div class="detail-val">${safeTarget}</div>
             </div>
             <div class="detail-cell">
                 <div class="detail-label">SEVERITY / SCORE</div>
-                <div class="detail-val">${alert.level} (${(alert.score || 0).toFixed(1)})</div>
+                <div class="detail-val">${safeLevel} (${(alert.score || 0).toFixed(1)})</div>
             </div>
             <div class="detail-cell">
                 <div class="detail-label">SENSOR</div>
-                <div class="detail-val">${alert.sensor || 'SAR'}</div>
+                <div class="detail-val">${safeSensor}</div>
             </div>
             <div class="detail-cell">
                 <div class="detail-label">DARK VESSEL</div>
@@ -785,9 +895,9 @@ Lineage: Walk intact to source asset
 
         <div class="section-divider">EXPLAINABLE HYPOTHESIS</div>
         <div class="explain-box">
-            <div class="explain-title">${hyp.statement || 'UNVERIFIED_SURFACE_TARGET'}</div>
-            <div class="explain-desc">${hyp.primary_explanation || hyp.explanation || 'No primary explanation provided'}</div>
-            <div class="explain-rationale">${hyp.detailed_rationale || ''}</div>
+            <div class="explain-title">${safeStatement}</div>
+            <div class="explain-desc">${safeExplanation}</div>
+            <div class="explain-rationale">${safeRationale}</div>
         </div>
 
         <div class="section-divider">HONEST CONFIDENCE VECTOR</div>
@@ -806,7 +916,7 @@ Lineage: Walk intact to source asset
             </div>
             <div class="conf-cell" style="grid-column: span 2;">
                 <div class="conf-label">DATA QUALITY &amp; CALIBRATION STATE</div>
-                <div class="conf-val">${(conf.quality_score ?? 1.0).toFixed(2)} [${conf.calibration_state || 'NOT_CALIBRATED'}]</div>
+                <div class="conf-val">${(conf.quality_score ?? 1.0).toFixed(2)} [${safeCalibState}]</div>
             </div>
         </div>
 
@@ -815,12 +925,12 @@ Lineage: Walk intact to source asset
             ${supp.length > 0 ? supp.map(ev => `
                 <div class="evidence-card supporting">
                     <div class="evidence-head">
-                        <span>${ev.kind || 'EVIDENCE'}</span>
+                        <span>${escapeHtml(ev.kind || 'EVIDENCE')}</span>
                         <span style="color: #10b981;">+${Number(ev.value ?? 1).toFixed(2)}</span>
                     </div>
                     <div class="evidence-body">
-                        Source: <b>${ev.source || 'Sensor'}</b> | Supports: <b>${ev.supports || 'TARGET'}</b><br/>
-                        ${(ev.references || []).join(' | ')}
+                        Source: <b>${escapeHtml(ev.source || 'Sensor')}</b> | Supports: <b>${escapeHtml(ev.supports || 'TARGET')}</b><br/>
+                        ${(ev.references || []).map(r => escapeHtml(r)).join(' | ')}
                     </div>
                 </div>
             `).join('') : '<div style="color: #64748b; font-size: 10px; font-style: italic;">No supporting evidence</div>'}
@@ -831,22 +941,30 @@ Lineage: Walk intact to source asset
             ${refut.length > 0 ? refut.map(ev => `
                 <div class="evidence-card refuting">
                     <div class="evidence-head">
-                        <span>${ev.kind || 'REFUTING'}</span>
+                        <span>${escapeHtml(ev.kind || 'REFUTING')}</span>
                         <span style="color: #ef4444;">-${Number(ev.value ?? 1).toFixed(2)}</span>
                     </div>
                     <div class="evidence-body">
-                        Source: <b>${ev.source || 'Sensor'}</b> | Counter: <b>${ev.supports || 'TARGET'}</b><br/>
-                        ${(ev.references || []).join(' | ')}
+                        Source: <b>${escapeHtml(ev.source || 'Sensor')}</b> | Counter: <b>${escapeHtml(ev.supports || 'TARGET')}</b><br/>
+                        ${(ev.references || []).map(r => escapeHtml(r)).join(' | ')}
                     </div>
                 </div>
             `).join('') : '<div style="color: #64748b; font-size: 10px; font-style: italic;">No refuting evidence observed.</div>'}
         </div>
 
+        <div class="section-divider">PROVENANCE &amp; AUDIT TRAIL</div>
+        <div class="chip-meta-box">
+Pipeline: ${safePipeline}
+Asset: ${safeAssetId}
+Run: ${safeRunId}
+Lineage: Walk intact to source asset
+        </div>
+
         <div class="section-divider">OPERATOR REVIEW ACTION</div>
         <div class="action-buttons">
-            <button class="btn btn-confirm" onclick="performAlertAction('${alert.alert_id}', 'CONFIRM')">CONFIRM</button>
-            <button class="btn btn-dismiss" onclick="performAlertAction('${alert.alert_id}', 'DISMISS')">DISMISS</button>
-            <button class="btn btn-uncertain" onclick="performAlertAction('${alert.alert_id}', 'FLAG_UNCERTAIN')">UNCERTAIN</button>
+            <button class="btn btn-confirm" data-action="CONFIRM" data-alert-id="${safeAlertId}">CONFIRM</button>
+            <button class="btn btn-dismiss" data-action="DISMISS" data-alert-id="${safeAlertId}">DISMISS</button>
+            <button class="btn btn-uncertain" data-action="FLAG_UNCERTAIN" data-alert-id="${safeAlertId}">UNCERTAIN</button>
         </div>
     `;
 }
@@ -855,15 +973,42 @@ async function performAlertAction(alertId, action) {
     try {
         const resp = await fetch(`/api/alerts/${alertId}/action`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: getAuthHeaders(),
             body: JSON.stringify({ action: action, notes: `Operator action ${action} from Tactical Command UI` })
         });
         if (resp.ok) {
             await fetchAlerts();
             selectAlert(alertId);
+        } else {
+            const err = await resp.json().catch(() => ({}));
+            const msg = err.errors && err.errors.length > 0 ? err.errors[0].message : (err.detail || "Action forbidden or failed");
+            alert(`Review action rejected: ${msg}`);
         }
     } catch (e) {
     }
+}
+
+function setupDelegatedEvents() {
+    document.addEventListener("click", (e) => {
+        const tabBtn = e.target.closest("[data-tab]");
+        if (tabBtn) {
+            const tab = tabBtn.getAttribute("data-tab");
+            if (tab) {
+                setChipTab(tab);
+                return;
+            }
+        }
+
+        const actionBtn = e.target.closest("[data-action]");
+        if (actionBtn) {
+            const action = actionBtn.getAttribute("data-action");
+            const alertId = actionBtn.getAttribute("data-alert-id");
+            if (action && alertId) {
+                performAlertAction(alertId, action);
+                return;
+            }
+        }
+    });
 }
 
 function auditAlert(alertId, status) {
@@ -874,4 +1019,11 @@ function setupFilters() {
     document.getElementById("filter-zone").addEventListener("change", fetchAlerts);
     document.getElementById("filter-level").addEventListener("change", fetchAlerts);
     document.getElementById("filter-status").addEventListener("change", fetchAlerts);
+}
+
+if (typeof window !== "undefined") {
+    window.escapeHtml = escapeHtml;
+}
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = { escapeHtml };
 }

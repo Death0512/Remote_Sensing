@@ -38,7 +38,28 @@ def _serialize_provenance(prov: Optional[Provenance]) -> Optional[dict[str, Any]
         if hasattr(prov.processing_time_utc, "isoformat")
         else str(prov.processing_time_utc),
         "parent_provenance_id": prov.parent_provenance_id,
+        "schema_version": getattr(prov, "schema_version", "provenance.v3"),
     }
+
+
+def _serialize_confidence(conf: Any) -> Optional[dict[str, Any]]:
+    if conf is None:
+        return None
+    if hasattr(conf, "to_dict"):
+        return conf.to_dict()
+    if isinstance(conf, dict):
+        return conf
+    if hasattr(conf, "raw_score"):
+        return {
+            "raw_score": conf.raw_score,
+            "model_score": getattr(conf, "model_score", None),
+            "calibrated_probability": getattr(conf, "calibrated_probability", None),
+            "uncertainty": getattr(conf, "uncertainty", None),
+            "quality_score": getattr(conf, "quality_score", 1.0),
+            "calibration_state": conf.calibration_state.value if hasattr(getattr(conf, "calibration_state", None), "value") else str(getattr(conf, "calibration_state", None)),
+            "schema_version": getattr(conf, "schema_version", "confidence_vector.v3"),
+        }
+    return {"raw_score": float(conf)}
 
 
 def _serialize_evidence(ev: Any) -> dict[str, Any]:
@@ -63,23 +84,32 @@ def _serialize_evidence(ev: Any) -> dict[str, Any]:
 
 
 def _write_raw_tiff(path: Path, arr: np.ndarray) -> None:
-    if arr.ndim == 2:
-        if arr.dtype in (np.float32, np.float64):
-            Image.fromarray(arr.astype(np.float32)).save(path)
-        elif arr.dtype in (np.uint16, np.int16, np.uint8):
-            Image.fromarray(arr).save(path)
+    float_arr = arr.astype(np.float32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if float_arr.ndim == 2:
+        h, w = float_arr.shape
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with rasterio.open(
+                str(path),
+                "w",
+                driver="GTiff",
+                height=h,
+                width=w,
+                count=1,
+                dtype="float32",
+            ) as dst:
+                dst.write(float_arr, 1)
+    elif float_arr.ndim == 3:
+        if float_arr.shape[0] in (1, 3, 4) and float_arr.shape[0] < float_arr.shape[1]:
+            channels, h, w = float_arr.shape
+            bands_data = float_arr
+        elif float_arr.shape[2] in (1, 3, 4):
+            h, w, channels = float_arr.shape
+            bands_data = np.transpose(float_arr, (2, 0, 1))
         else:
-            Image.fromarray(arr.astype(np.float32)).save(path)
-    elif arr.ndim == 3:
-        if arr.shape[0] in (1, 3, 4) and arr.shape[0] < arr.shape[1]:
-            channels, h, w = arr.shape
-            bands_data = arr
-        elif arr.shape[2] in (1, 3, 4):
-            h, w, channels = arr.shape
-            bands_data = np.transpose(arr, (2, 0, 1))
-        else:
-            channels, h, w = arr.shape
-            bands_data = arr
+            channels, h, w = float_arr.shape
+            bands_data = float_arr
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             with rasterio.open(
@@ -89,7 +119,7 @@ def _write_raw_tiff(path: Path, arr: np.ndarray) -> None:
                 height=h,
                 width=w,
                 count=channels,
-                dtype=str(arr.dtype),
+                dtype="float32",
             ) as dst:
                 dst.write(bands_data)
     else:
@@ -97,39 +127,37 @@ def _write_raw_tiff(path: Path, arr: np.ndarray) -> None:
 
 
 def _write_preview_png(path: Path, arr: np.ndarray) -> None:
-    if arr.dtype == np.uint8 and arr.ndim in (2, 3):
-        if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[0] < arr.shape[1]:
-            arr_img = np.transpose(arr, (1, 2, 0))
-        else:
-            arr_img = arr
-        if arr_img.ndim == 3 and arr_img.shape[2] == 1:
-            arr_img = arr_img[:, :, 0]
-        Image.fromarray(arr_img).save(path)
-        return
-
+    path.parent.mkdir(parents=True, exist_ok=True)
     float_arr = arr.astype(np.float32)
     if float_arr.ndim == 3 and float_arr.shape[0] in (1, 3, 4) and float_arr.shape[0] < float_arr.shape[1]:
         float_arr = np.transpose(float_arr, (1, 2, 0))
     if float_arr.ndim == 3 and float_arr.shape[2] == 1:
         float_arr = float_arr[:, :, 0]
 
-    p2 = float(np.nanpercentile(float_arr, 2))
-    p98 = float(np.nanpercentile(float_arr, 98))
-    if p98 > p2:
-        stretched = np.clip((float_arr - p2) / (p98 - p2) * 255.0, 0, 255).astype(np.uint8)
+    if float_arr.size == 0:
+        stretched = np.zeros((1, 1), dtype=np.uint8)
     else:
-        stretched = np.clip(float_arr, 0, 255).astype(np.uint8)
-    Image.fromarray(stretched).save(path)
+        p2 = float(np.nanpercentile(float_arr, 2))
+        p98 = float(np.nanpercentile(float_arr, 98))
+        if p98 > p2:
+            stretched = np.clip((float_arr - p2) / (p98 - p2) * 255.0, 0, 255).astype(np.uint8)
+        else:
+            stretched = np.clip(float_arr, 0, 255).astype(np.uint8)
+    Image.fromarray(stretched).save(path.with_suffix(".png"))
 
 
 def _write_analysis_tensor(path: Path, arr: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     norm_arr = arr.astype(np.float32)
+    min_val = float(np.nanmin(norm_arr)) if norm_arr.size > 0 else 0.0
+    max_val = float(np.nanmax(norm_arr)) if norm_arr.size > 0 else 1.0
+    if max_val > 1.0 or min_val < 0.0:
+        if max_val > min_val:
+            norm_arr = (norm_arr - min_val) / (max_val - min_val)
+        else:
+            norm_arr = np.zeros_like(norm_arr)
     np.save(path.with_suffix(".npy"), norm_arr)
-    if norm_arr.ndim in (2, 3):
-        try:
-            _write_raw_tiff(path.with_suffix(".tif"), norm_arr)
-        except Exception:
-            pass
+    _write_raw_tiff(path.with_suffix(".tif"), norm_arr)
 
 
 class AlertPackageBuilder:
@@ -143,13 +171,14 @@ class AlertPackageBuilder:
         output_dir: Union[str, Path],
         detection: Optional[Detection] = None,
         track_id: Optional[str] = None,
+        schema_version: Optional[str] = None,
         **kwargs: Any,
     ) -> Path:
         validate_priority_gating(alert.priority, alert.zone, hypothesis)
 
         out_path = Path(output_dir)
         folder_name = alert.alert_id if alert.alert_id.startswith("alert_") else f"alert_{alert.alert_id}"
-        package_dir = out_path / folder_name
+        package_dir = out_path if out_path.name == folder_name else out_path / folder_name
 
         raw_dir = package_dir / "chips" / "raw"
         analysis_dir = package_dir / "chips" / "analysis"
@@ -206,12 +235,28 @@ class AlertPackageBuilder:
                     _write_analysis_tensor(analysis_dir / k, v)
                     _write_preview_png(preview_dir / f"{k}.png", v)
 
+        if schema_version is not None:
+            resolved_schema = str(schema_version)
+        elif kwargs.get("schema_version") is not None:
+            resolved_schema = str(kwargs["schema_version"])
+        elif alert.provenance and alert.provenance.pipeline_version == "2.0.0":
+            resolved_schema = "2.0.0"
+        else:
+            resolved_schema = "3.0.0"
+
+        if alert.provenance and alert.provenance.pipeline_version:
+            pipeline_version = alert.provenance.pipeline_version
+        else:
+            pipeline_version = "3.0.0"
+
         manifest_data = {
             "alert_id": alert.alert_id,
             "hypothesis_id": alert.hypothesis_id,
-            "schema_version": "2.0.0",
-            "version": "2.0.0",
-            "pipeline_version": alert.provenance.pipeline_version,
+            "schema_version": resolved_schema,
+            "version": resolved_schema,
+            "package_schema": "alert_package.v3",
+            "package_format": "alert_package.v3",
+            "pipeline_version": pipeline_version,
             "creation_time_utc": datetime.now(timezone.utc).isoformat(),
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "zone": alert.zone.value if hasattr(alert.zone, "value") else str(alert.zone),
@@ -220,7 +265,12 @@ class AlertPackageBuilder:
             "operator_review_status": alert.review_state.value if hasattr(alert.review_state, "value") else str(alert.review_state),
             "review_status": alert.review_state.value if hasattr(alert.review_state, "value") else str(alert.review_state),
             "bundle_uri": alert.bundle_uri,
-            "provenance_id": alert.provenance.provenance_id,
+            "provenance_id": alert.provenance.provenance_id if alert.provenance else None,
+            "chips": {
+                "raw": sorted([p.name for p in raw_dir.glob("*")]),
+                "analysis": sorted([p.name for p in analysis_dir.glob("*")]),
+                "preview": sorted([p.name for p in preview_dir.glob("*")]),
+            },
             "hypothesis": {
                 "hypothesis_id": hypothesis.hypothesis_id,
                 "statement": hypothesis.statement.value if hasattr(hypothesis.statement, "value") else str(hypothesis.statement),
@@ -230,11 +280,15 @@ class AlertPackageBuilder:
                 "explanation": hypothesis.explanation,
                 "detailed_rationale": hypothesis.detailed_rationale,
             },
-            "chips": {
-                "raw": sorted([p.name for p in raw_dir.glob("*")]),
-                "analysis": sorted([p.name for p in analysis_dir.glob("*")]),
-                "preview": sorted([p.name for p in preview_dir.glob("*")]),
-            },
+            "provenance": _serialize_provenance(alert.provenance) if alert.provenance else None,
+            "provenance_summary": {
+                "provenance_id": alert.provenance.provenance_id if alert.provenance else None,
+                "pipeline_version": alert.provenance.pipeline_version if alert.provenance else None,
+                "git_commit": alert.provenance.git_commit if alert.provenance else None,
+                "config_hash": alert.provenance.config_hash if alert.provenance else None,
+                "input_checksum": alert.provenance.input_checksum if alert.provenance else None,
+                "output_checksum": alert.provenance.output_checksum if alert.provenance else None,
+            } if alert.provenance else None,
         }
         with open(package_dir / "manifest.json", "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2)
@@ -251,7 +305,7 @@ class AlertPackageBuilder:
             "calibration_state": hypothesis.calibration_state.value if hasattr(hypothesis.calibration_state, "value") else str(hypothesis.calibration_state),
             "explanation": hypothesis.explanation,
             "detailed_rationale": hypothesis.detailed_rationale,
-            "primary_explanation": hypothesis.primary_explanation,
+            "primary_explanation": getattr(hypothesis, "primary_explanation", hypothesis.explanation),
             "evidence_ids": list(hypothesis.evidence_ids),
             "supporting_evidence_count": len(hypothesis.supporting_evidence),
             "refuting_evidence_count": len(hypothesis.refuting_evidence),
@@ -269,20 +323,22 @@ class AlertPackageBuilder:
             json.dump(refuting_data, f, indent=2)
 
         if detection is not None:
-            geom_dict = shapely.geometry.mapping(detection.geom_wgs84) if hasattr(detection, "geom_wgs84") else None
-            bbox_list = list(detection.geom_wgs84.bounds) if hasattr(detection, "geom_wgs84") and hasattr(detection.geom_wgs84, "bounds") else None
+            geom_wgs = detection.geom_wgs84 if getattr(detection, "geom_wgs84", None) is not None else getattr(detection, "geometry", None)
+            geom_dict = shapely.geometry.mapping(geom_wgs) if geom_wgs is not None else None
+            bbox_list = list(geom_wgs.bounds) if geom_wgs is not None and hasattr(geom_wgs, "bounds") else None
+            conf_data = _serialize_confidence(detection.confidence)
             props = {
                 "detection_id": detection.detection_id,
-                "candidate_id": detection.candidate_id,
+                "candidate_id": getattr(detection, "candidate_id", None),
                 "alert_id": alert.alert_id,
                 "hypothesis_id": alert.hypothesis_id,
                 "sensor": detection.sensor.value if hasattr(detection.sensor, "value") else str(detection.sensor),
                 "target_class": detection.target_class.value if hasattr(detection.target_class, "value") else str(detection.target_class),
-                "geom_px": list(detection.geom_px) if hasattr(detection, "geom_px") else None,
+                "geom_px": list(detection.geom_px) if hasattr(detection, "geom_px") and detection.geom_px is not None else None,
                 "crs": detection.crs if hasattr(detection, "crs") else "EPSG:4326",
                 "zone": alert.zone.value if hasattr(alert.zone, "value") else str(alert.zone),
                 "track_id": track_id or kwargs.get("track_id") or kwargs.get("track_ref"),
-                "confidence": detection.confidence.to_dict() if hasattr(detection.confidence, "to_dict") else None,
+                "confidence": conf_data,
                 "attributes": dict(detection.attributes) if hasattr(detection, "attributes") and detection.attributes else {},
                 "acquisition_time_utc": detection.acquisition_time_utc.isoformat() if hasattr(detection, "acquisition_time_utc") and detection.acquisition_time_utc else None,
             }
@@ -290,12 +346,14 @@ class AlertPackageBuilder:
             geom_dict = kwargs.get("geometry", {"type": "Point", "coordinates": [0.0, 0.0]})
             bbox_list = kwargs.get("bbox", [0.0, 0.0, 0.0, 0.0])
             props = {
+                "detection_id": kwargs.get("detection_id", f"det_{alert.alert_id}"),
                 "alert_id": alert.alert_id,
                 "hypothesis_id": alert.hypothesis_id,
                 "zone": alert.zone.value if hasattr(alert.zone, "value") else str(alert.zone),
                 "track_id": track_id or kwargs.get("track_id") or kwargs.get("track_ref"),
                 "target_class": kwargs.get("target_class", "UNIDENTIFIED"),
                 "sensor": kwargs.get("sensor", "S1_SAR"),
+                "confidence": _serialize_confidence(kwargs.get("confidence")),
                 "bbox": bbox_list,
                 "attributes": kwargs.get("attributes", {}),
             }

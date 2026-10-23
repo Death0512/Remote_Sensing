@@ -29,6 +29,7 @@ class QualityTier(str, Enum):
     RADIOMETRIC_UNCERTAIN = "RADIOMETRIC_UNCERTAIN"
     OUTSIDE_VALID_FOOTPRINT = "OUTSIDE_VALID_FOOTPRINT"
     STALE = "STALE"
+    CORRUPTED_METADATA = "CORRUPTED_METADATA"
 
     HIGH = "DATA_OK"
     PARTIAL = "DATA_PARTIAL"
@@ -42,12 +43,36 @@ class AisCorrelationState(str, Enum):
     AIS_STALE = "AIS_STALE"
     CORRELATION_UNCERTAIN = "CORRELATION_UNCERTAIN"
 
+    AIS_MATCHED = "MATCHED"
+    AIS_NO_MATCH_WITHIN_VERIFIED_COVERAGE = "NO_MATCH"
+
 
 class TargetClass(str, Enum):
     VESSEL = "VESSEL"
     AIRCRAFT = "AIRCRAFT"
     INFRASTRUCTURE_CHANGE = "INFRASTRUCTURE_CHANGE"
     UNIDENTIFIED = "UNIDENTIFIED"
+    NEW_STRUCTURE = "NEW_STRUCTURE"
+    UNKNOWN_STRUCTURE = "UNKNOWN_STRUCTURE"
+    AIRCRAFT_PARKED = "AIRCRAFT_PARKED"
+    AIRCRAFT_INFLIGHT = "AIRCRAFT_INFLIGHT"
+
+    @classmethod
+    def _missing_(cls, value: object):
+        if isinstance(value, str):
+            val_upper = value.upper()
+            for member in cls:
+                if member.value == val_upper or member.name == val_upper:
+                    return member
+        return None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.value == other or self.value == other.upper() or self.name == other.upper()
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
 
 
 class HypothesisStatement(str, Enum):
@@ -116,6 +141,7 @@ class RadiometricState(str, Enum):
     CALIBRATED_SIGMA0 = "CALIBRATED_SIGMA0"
     CALIBRATED_GAMMA0 = "CALIBRATED_GAMMA0"
     TOA_REFLECTANCE = "TOA_REFLECTANCE"
+    SURFACE_REFLECTANCE = "SURFACE_REFLECTANCE"
 
 
 class GeometricState(str, Enum):
@@ -136,3 +162,54 @@ class ScoreMethod(str, Enum):
     BAYESIAN = "BAYESIAN"
     CALIBRATED_CLASSIFIER = "CALIBRATED_CLASSIFIER"
     NONE = "NONE"
+
+
+class GeometryStatus(str, Enum):
+    GEOCODED = "GEOCODED"
+    MAP_ONLY = "MAP_ONLY"
+    PIXEL_ONLY = "PIXEL_ONLY"
+    UNKNOWN = "UNKNOWN"
+
+    @classmethod
+    def _missing_(cls, value: object):
+        if isinstance(value, str):
+            val_upper = value.upper()
+            for member in cls:
+                if member.value == val_upper or member.name == val_upper:
+                    return member
+        return None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.value == other or self.value == other.upper() or self.name == other.upper()
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+
+class MotionClass(str, Enum):
+    STATIONARY = "STATIONARY"
+    VESSEL = "VESSEL"
+    AIRCRAFT = "AIRCRAFT"
+    UNKNOWN = "UNKNOWN"
+
+    @classmethod
+    def _missing_(cls, value: object):
+        if isinstance(value, str):
+            val_upper = value.upper()
+            for member in cls:
+                if member.value == val_upper or member.name == val_upper:
+                    return member
+        return None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.value == other or self.value == other.upper() or self.name == other.upper()
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.value)
+
+
+CalibrationStatus = CalibrationState

@@ -3,15 +3,19 @@ from datetime import datetime, timezone
 import io
 import json
 import math
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, List, Optional
 import urllib.request
 import uuid
+import requests
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 import numpy as np
 from PIL import Image
@@ -22,6 +26,19 @@ from shapely.geometry import Polygon
 from src.alerting.package.builder import AlertPackageBuilder
 from src.alerting.priority import determine_alert_priority
 from src.alerting.review.store import ReviewAuditStore
+from src.api.auth import (
+    AuthenticatedUser,
+    Role,
+    TokenRequest,
+    TokenResponse,
+    authenticate_user,
+    bearer_security,
+    create_access_token,
+    get_current_user,
+    get_jwt_secret,
+    is_production,
+    require_role,
+)
 from src.detection.change.change_detector import BitemporalChangeDetector
 from src.detection.experimental.parallax_detector import ParallaxInflightDetector
 from src.detection.optical.aircraft_detector import OpticalAircraftDetector
@@ -45,15 +62,21 @@ from src.domain.enums import (
 from src.domain.evidence import Evidence
 from src.domain.hypothesis import Hypothesis
 from src.domain.provenance import Provenance
-from src.fusion.ais.correlator import AisCorrelator
+from src.ingestion.exceptions import DataUnavailableError
 from src.ingestion.providers.cdse_provider import CdseProvider
 from src.ingestion.providers.factory import ProviderFactory, get_provider
 from src.ingestion.providers.mock_provider import MockSatelliteProvider
 from src.ingestion.providers.planetary_provider import PlanetaryComputerProvider
 from src.intelligence.accumulator import EvidenceAccumulator
+from src.intelligence.ais.correlator import (
+    AisCorrelator,
+    AisCoverageModel,
+    AisCoverageZone,
+)
 from src.intelligence.hypothesis.engine import HypothesisEngine
 from src.preprocessing.geometry.geofence import GeofenceManager
 from src.preprocessing.geometry.tiling import MetricTiler
+from src.provenance.builder import ProvenanceBuilder
 from src.tracking.tracker import MultiLookTracker
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -62,6 +85,40 @@ AOI_DIR = BASE_DIR / "data" / "aoi"
 WEB_DIR = BASE_DIR / "web"
 DB_PATH = OUTPUTS_DIR / "alerts.db"
 AUDIT_LOG_PATH = OUTPUTS_DIR / "audit_log.jsonl"
+
+
+DEFAULT_ALLOWED_ORIGINS = [
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://localhost:5173",
+]
+_env_origins = os.environ.get("ALLOWED_ORIGINS")
+if _env_origins:
+    ALLOWED_ORIGINS = [o.strip() for o in _env_origins.split(",") if o.strip()]
+else:
+    ALLOWED_ORIGINS = DEFAULT_ALLOWED_ORIGINS
+
+REQUIRE_AUTH_FOR_READS = os.environ.get("REQUIRE_AUTH_FOR_READS", "0").lower() in ("1", "true")
+
+
+def get_optional_or_strict_reader(
+    request: Request,
+    bearer_creds: Optional[HTTPAuthorizationCredentials] = Security(bearer_security),
+) -> Optional[AuthenticatedUser]:
+    if REQUIRE_AUTH_FOR_READS or os.environ.get("REQUIRE_AUTH_FOR_READS", "0").lower() in ("1", "true"):
+        user = get_current_user(request, bearer_creds=bearer_creds)
+        allowed = {Role.VIEWER.value, Role.ANALYST.value, Role.OPERATOR.value, Role.SUPERVISOR.value, Role.ADMIN.value}
+        if user.role.value not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Insufficient permissions: role '{user.role.value}' not in allowed roles {list(allowed)}",
+            )
+        return user
+    return None
+
+
+get_read_user_dependency = get_optional_or_strict_reader
 
 
 def get_db_connection() -> sqlite3.Connection:
@@ -114,7 +171,6 @@ def init_db() -> None:
             """
         )
         conn.commit()
-
         cursor = conn.execute("SELECT COUNT(*) FROM alerts")
         count = cursor.fetchone()[0]
         if count == 0:
@@ -180,6 +236,7 @@ def _seed_alerts_from_geojson(conn: sqlite3.Connection) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    get_jwt_secret()
     init_db()
     yield
 
@@ -191,7 +248,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -201,10 +258,91 @@ if WEB_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
+def envelope_response(
+    data: Any,
+    status_str: str = "SUCCESS",
+    provenance: Optional[Dict[str, Any]] = None,
+    errors: Optional[List[Dict[str, Any]]] = None,
+    status_code: int = 200,
+) -> JSONResponse:
+    content = {
+        "status": status_str,
+        "data": data,
+        "provenance": provenance,
+        "errors": errors or [],
+    }
+    return JSONResponse(status_code=status_code, content=content)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    code_str = "ERROR"
+    if exc.status_code == 401:
+        code_str = "UNAUTHORIZED"
+    elif exc.status_code == 403:
+        code_str = "FORBIDDEN"
+    elif exc.status_code == 404:
+        code_str = "NOT_FOUND"
+    elif exc.status_code == 500:
+        code_str = "INTERNAL_SERVER_ERROR"
+    elif exc.status_code == 503:
+        code_str = "DATA_UNAVAILABLE"
+
+    status_field = "DATA_UNAVAILABLE" if exc.status_code == 503 else "ERROR"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": status_field,
+            "data": None,
+            "provenance": None,
+            "errors": [{"code": code_str, "message": str(exc.detail)}],
+        },
+    )
+
+
+@app.exception_handler(DataUnavailableError)
+async def data_unavailable_exception_handler(request: Request, exc: DataUnavailableError):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "DATA_UNAVAILABLE",
+            "data": None,
+            "provenance": None,
+            "errors": [{"code": "DATA_UNAVAILABLE", "message": str(exc)}],
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "ERROR",
+            "data": None,
+            "provenance": None,
+            "errors": [{"code": "VALIDATION_ERROR", "message": str(exc.errors())}],
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    message = "An internal server error occurred" if is_production() else str(exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "ERROR",
+            "data": None,
+            "provenance": None,
+            "errors": [{"code": "INTERNAL_SERVER_ERROR", "message": message}],
+        },
+    )
+
+
 class ActionRequest(BaseModel):
     action: Optional[str] = None
     status: Optional[str] = None
-    operator_id: Optional[str] = "operator_default"
     note: Optional[str] = ""
     notes: Optional[str] = ""
 
@@ -219,6 +357,24 @@ class ScanAoiRequest(BaseModel):
     source: str = "satellite_hd"
     date: Optional[str] = None
     detector: Optional[str] = "all"
+
+
+@app.post("/api/auth/token")
+def login_for_access_token(req: TokenRequest):
+    user = authenticate_user(req.username, req.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+        )
+    token = create_access_token(user_id=user.user_id, role=user.role, username=user.username)
+    data = {
+        "access_token": token,
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "user": user.to_dict(),
+    }
+    return envelope_response(data=data, status_str="SUCCESS")
 
 
 def _lon_to_tile_x(lon: float, zoom: int) -> int:
@@ -248,33 +404,24 @@ def _fetch_tile(source: str, date_str: str, zoom: int, x: int, y: int) -> Image.
     else:
         url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
 
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RemoteSensingCommand/2.0"},
-    )
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RemoteSensingCommand/2.0"}
     try:
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            data = resp.read()
-            return Image.open(io.BytesIO(data)).convert("RGB")
+        resp = requests.get(url, headers=headers, timeout=5.0)
+        if resp.status_code == 200:
+            return Image.open(io.BytesIO(resp.content)).convert("RGB")
     except Exception:
-        if source == "sentinel2":
-            fallback_url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
-            try:
-                fb_req = urllib.request.Request(
-                    fallback_url,
-                    headers={"User-Agent": "Mozilla/5.0 RemoteSensingCommand/2.0"},
-                )
-                with urllib.request.urlopen(fb_req, timeout=3.0) as fb_resp:
-                    return Image.open(io.BytesIO(fb_resp.read())).convert("RGB")
-            except Exception:
-                pass
-        seed = (int(x) * 73856093 ^ int(y) * 19349663 ^ int(zoom) * 83492791) % (2**31 - 1)
-        rng = np.random.default_rng(seed)
-        base = np.zeros((256, 256, 3), dtype=np.uint8)
-        base[:, :, 0] = rng.integers(15, 45, size=(256, 256), dtype=np.uint8)
-        base[:, :, 1] = rng.integers(30, 75, size=(256, 256), dtype=np.uint8)
-        base[:, :, 2] = rng.integers(60, 110, size=(256, 256), dtype=np.uint8)
-        return Image.fromarray(base)
+        pass
+
+    if source == "sentinel2":
+        fallback_url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
+        try:
+            fb_resp = requests.get(fallback_url, headers=headers, timeout=4.0)
+            if fb_resp.status_code == 200:
+                return Image.open(io.BytesIO(fb_resp.content)).convert("RGB")
+        except Exception:
+            pass
+
+    raise DataUnavailableError(f"DATA_UNAVAILABLE: tile fetch failed for source={source}, zoom={zoom}, x={x}, y={y}")
 
 
 def _row_to_alert_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -319,6 +466,8 @@ def _row_to_alert_dict(row: sqlite3.Row) -> dict[str, Any]:
         score_val = hyp_obj.get("score", score)
         score_method = hyp_obj.get("score_method", ScoreMethod.RULE_ENGINE.value)
         calibration_state = hyp_obj.get("calibration_state", CalibrationState.NOT_CALIBRATED.value)
+        calibrated_prob = hyp_obj.get("calibrated_probability", None)
+        quality_score = hyp_obj.get("quality_score", 1.0)
     else:
         if "aircraft" in target_class.lower():
             statement = HypothesisStatement.EXPERIMENTAL_INFLIGHT_TARGET.value
@@ -339,6 +488,8 @@ def _row_to_alert_dict(row: sqlite3.Row) -> dict[str, Any]:
         score_val = score
         score_method = ScoreMethod.RULE_ENGINE.value
         calibration_state = CalibrationState.NOT_CALIBRATED.value
+        calibrated_prob = None
+        quality_score = 1.0
 
     zone_enum_val = f"ZONE_{zone}" if zone in (1, 2, 3) else "OUTSIDE_AOI"
 
@@ -390,6 +541,17 @@ def _row_to_alert_dict(row: sqlite3.Row) -> dict[str, Any]:
     analysis_url = f"/api/chips/{alert_id}/analysis.tif"
     raw_url = f"/api/chips/{alert_id}/raw.tif"
 
+    prov_dict = None
+    if manifest_data and "provenance" in manifest_data:
+        prov_dict = manifest_data["provenance"]
+    else:
+        prov_dict = {
+            "pipeline_version": "3.0.0",
+            "source_asset_id": f"ASSET_{alert_id}",
+            "processing_run_id": f"run_{alert_id}",
+            "timestamp_utc": ts,
+        }
+
     return {
         "alert_id": alert_id,
         "det_id": det_id,
@@ -423,10 +585,10 @@ def _row_to_alert_dict(row: sqlite3.Row) -> dict[str, Any]:
         "confidence": {
             "raw_score": score_val,
             "model_score": score_val,
-            "calibrated_probability": None,
+            "calibrated_probability": calibrated_prob,
             "uncertainty": 0.15,
-            "quality_score": 1.0,
-            "calibration_state": CalibrationState.NOT_CALIBRATED.value,
+            "quality_score": quality_score,
+            "calibration_state": calibration_state,
         },
         "evidence": {
             "supporting": supporting_evidence,
@@ -437,11 +599,12 @@ def _row_to_alert_dict(row: sqlite3.Row) -> dict[str, Any]:
             "analysis": analysis_url,
             "raw": raw_url,
         },
+        "provenance": prov_dict,
     }
 
 
 @app.get("/")
-def get_index():
+def get_index(_current_user: Optional[AuthenticatedUser] = Depends(get_optional_or_strict_reader)):
     index_file = WEB_DIR / "index.html"
     if not index_file.is_file():
         raise HTTPException(status_code=404, detail="Web dashboard index.html not found")
@@ -449,7 +612,7 @@ def get_index():
 
 
 @app.get("/api/zones")
-def get_zones():
+def get_zones(_current_user: Optional[AuthenticatedUser] = Depends(get_optional_or_strict_reader)):
     features: List[Dict[str, Any]] = []
     zone_files = [
         (1, AOI_DIR / "zone1_critical_500km.geojson"),
@@ -467,14 +630,18 @@ def get_zones():
             except Exception:
                 pass
 
-    return {"type": "FeatureCollection", "features": features}
+    return envelope_response(
+        data={"type": "FeatureCollection", "features": features},
+        provenance={"pipeline_version": "3.0.0", "source": "geofence_zones"},
+    )
 
 
 @app.get("/api/alerts")
 def get_alerts(
     level: Optional[str] = Query(None),
     zone: Optional[int] = Query(None),
-    status: Optional[str] = Query(None),
+    status_param: Optional[str] = Query(None, alias="status"),
+    _current_user: Optional[AuthenticatedUser] = Depends(get_optional_or_strict_reader),
 ):
     query = "SELECT * FROM alerts WHERE 1=1"
     params: List[Any] = []
@@ -485,9 +652,9 @@ def get_alerts(
     if zone is not None:
         query += " AND zone = ?"
         params.append(zone)
-    if status and status != "ALL":
+    if status_param and status_param != "ALL":
         query += " AND status = ?"
-        params.append(status)
+        params.append(status_param)
 
     query += " ORDER BY score DESC"
 
@@ -496,17 +663,31 @@ def get_alerts(
         rows = cursor.fetchall()
         alerts = [_row_to_alert_dict(row) for row in rows]
 
-    return alerts
+    return envelope_response(
+        data=alerts,
+        provenance={
+            "pipeline_version": "3.0.0",
+            "total_alerts": len(alerts),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 @app.get("/api/alerts/{alert_id}")
-def get_alert_by_id(alert_id: str):
+def get_alert_by_id(
+    alert_id: str,
+    _current_user: Optional[AuthenticatedUser] = Depends(get_optional_or_strict_reader),
+):
     with get_db_connection() as conn:
         cursor = conn.execute("SELECT * FROM alerts WHERE alert_id = ?", (alert_id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
-        return _row_to_alert_dict(row)
+        alert_dict = _row_to_alert_dict(row)
+        return envelope_response(
+            data=alert_dict,
+            provenance=alert_dict.get("provenance"),
+        )
 
 
 def _execute_review_action(alert_id: str, raw_action: str, operator_id: str, note: str) -> dict[str, Any]:
@@ -561,21 +742,47 @@ def _execute_review_action(alert_id: str, raw_action: str, operator_id: str, not
 
 
 @app.post("/api/alerts/{alert_id}/action")
-def post_alert_action(alert_id: str, req: ActionRequest):
+def post_alert_action(
+    alert_id: str,
+    req: ActionRequest,
+    current_user: AuthenticatedUser = Depends(require_role(Role.OPERATOR, Role.SUPERVISOR, Role.ADMIN)),
+):
     action_val = req.action or req.status
     if not action_val:
         raise HTTPException(status_code=400, detail="Missing action or status in request body")
     note_val = req.notes or req.note or ""
-    return _execute_review_action(alert_id, action_val, req.operator_id or "operator_default", note_val)
+    res = _execute_review_action(alert_id, action_val, current_user.user_id, note_val)
+    prov = {
+        "pipeline_version": "3.0.0",
+        "action": res["action"],
+        "operator_id": current_user.user_id,
+        "entry_hash": res["entry_hash"],
+        "previous_hash": res["previous_hash"],
+    }
+    return envelope_response(data=res, provenance=prov)
 
 
 @app.post("/api/alerts/{alert_id}/audit")
-def audit_alert(alert_id: str, req: AuditRequest):
-    return _execute_review_action(alert_id, req.status, "operator_default", req.note or "")
+def audit_alert(
+    alert_id: str,
+    req: AuditRequest,
+    current_user: AuthenticatedUser = Depends(require_role(Role.OPERATOR, Role.SUPERVISOR, Role.ADMIN)),
+):
+    res = _execute_review_action(alert_id, req.status, current_user.user_id, req.note or "")
+    prov = {
+        "pipeline_version": "3.0.0",
+        "operator_id": current_user.user_id,
+        "entry_hash": res["entry_hash"],
+        "previous_hash": res["previous_hash"],
+    }
+    return envelope_response(data=res, provenance=prov)
 
 
 @app.get("/api/chips/{chip_path:path}")
-def get_chip(chip_path: str):
+def get_chip(
+    chip_path: str,
+    _current_user: Optional[AuthenticatedUser] = Depends(get_optional_or_strict_reader),
+):
     if ".." in chip_path:
         raise HTTPException(status_code=404, detail="Chip not found")
 
@@ -647,7 +854,7 @@ def check_provider_health() -> dict[str, dict[str, Any]]:
 
 
 @app.get("/api/status")
-def get_status():
+def get_status(_current_user: Optional[AuthenticatedUser] = Depends(get_optional_or_strict_reader)):
     with get_db_connection() as conn:
         total = conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
         critical = conn.execute("SELECT COUNT(*) FROM alerts WHERE level = 'CRITICAL'").fetchone()[0]
@@ -685,7 +892,7 @@ def get_status():
         },
     }
 
-    return {
+    data = {
         "status": overall_status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "metrics": {
@@ -700,10 +907,19 @@ def get_status():
         "providers": provider_health,
         "capabilities": capabilities,
     }
+    prov = {
+        "pipeline_version": "3.0.0",
+        "system_status": overall_status,
+        "timestamp": data["timestamp"],
+    }
+    return envelope_response(data=data, provenance=prov)
 
 
 @app.post("/api/scan-map-aoi")
-def scan_map_aoi(req: ScanAoiRequest):
+def scan_map_aoi(
+    req: ScanAoiRequest,
+    current_user: AuthenticatedUser = Depends(require_role(Role.ANALYST, Role.OPERATOR, Role.SUPERVISOR, Role.ADMIN)),
+):
     if not req.bbox or len(req.bbox) != 4:
         raise HTTPException(status_code=400, detail="bbox must contain exactly 4 coordinates [min_lon, min_lat, max_lon, max_lat]")
 
@@ -799,10 +1015,16 @@ def scan_map_aoi(req: ScanAoiRequest):
     gray_float = np.mean(norm_float, axis=2)
 
     geofence = GeofenceManager()
-    center_lat = (north_lat + south_lat) / 2.0
-    center_lon = (west_lon + east_lon) / 2.0
-    default_zone = geofence.classify_zone(center_lat, center_lon)
-    zone_num = 1 if default_zone == Zone.ZONE_1 else (2 if default_zone == Zone.ZONE_2 else 3)
+    ais_coverage = AisCoverageModel(
+        zones=[
+            AisCoverageZone(
+                zone_id="VN_EEZ_COASTAL",
+                geometry=Polygon([(102.0, 6.0), (115.0, 6.0), (115.0, 22.0), (102.0, 22.0)]),
+                active=True,
+            )
+        ],
+        default_covered=False,
+    )
 
     local_peaks = scipy.ndimage.maximum_filter(gray_float, size=31)
     peak_mask = (gray_float == local_peaks) & (gray_float > np.mean(gray_float) + 0.1)
@@ -814,6 +1036,10 @@ def scan_map_aoi(req: ScanAoiRequest):
     chips_dir = OUTPUTS_DIR / "chips"
     chips_dir.mkdir(parents=True, exist_ok=True)
     builder = AlertPackageBuilder()
+    provenance_builder = ProvenanceBuilder(
+        pipeline_version="3.0.0",
+        config_source={"source": source, "zoom": zoom, "date": date_str},
+    )
     created_alerts: List[Dict[str, Any]] = []
 
     with get_db_connection() as conn:
@@ -823,7 +1049,10 @@ def scan_map_aoi(req: ScanAoiRequest):
             lon_pt = west_lon + (float(c) / float(total_w)) * (east_lon - west_lon)
             z_enum = geofence.classify_zone(lat_pt, lon_pt)
             z_val = 1 if z_enum == Zone.ZONE_1 else (2 if z_enum == Zone.ZONE_2 else 3)
-            is_dark = (z_val == 1)
+
+            target_class = "vessel" if z_val == 1 else "aircraft"
+            is_covered = ais_coverage.is_covered(lon_pt, lat_pt, acq_time)
+            is_dark = (target_class == "vessel") and is_covered
 
             half = 16
             r0 = max(0, r - half)
@@ -841,23 +1070,24 @@ def scan_map_aoi(req: ScanAoiRequest):
             chip_img.save(legacy_chip_png)
 
             score_val = 0.88 if is_dark else 0.72
-            target_class = "vessel" if z_val == 1 else "aircraft"
 
-            stmt = HypothesisStatement.DARK_VESSEL_TRANSITING if is_dark else HypothesisStatement.UNVERIFIED_SURFACE_TARGET
+            if is_dark:
+                stmt = HypothesisStatement.DARK_VESSEL_TRANSITING
+            elif target_class == "aircraft":
+                stmt = HypothesisStatement.EXPERIMENTAL_INFLIGHT_TARGET
+            else:
+                stmt = HypothesisStatement.UNVERIFIED_SURFACE_TARGET
             priority_val = determine_alert_priority(z_enum, stmt)
 
-            prov = Provenance(
-                provenance_id=str(uuid.uuid4()),
+            prov = provenance_builder.build(
                 source_asset_id=f"LIVE_{source.upper()}",
                 acquisition_metadata_ref=f"https://wmts/{source}/{date_str}",
-                pipeline_version="2.0.0",
-                git_commit="30d2bc8",
-                config_hash="live-scan-cfg",
-                model_id="v2-live-pipeline",
-                model_version="2.0.0",
-                input_checksum="live-bytes",
-                output_checksum="output-bytes",
+                input_data=chip_arr.tobytes(),
+                output_data=assigned_id.encode("utf-8"),
+                model_id="live_pipeline",
+                model_version="3.0.0",
                 processing_run_id=f"run-{int(acq_time.timestamp())}",
+                provenance_id=str(uuid.uuid4()),
                 processing_time_utc=acq_time,
             )
 
@@ -866,7 +1096,7 @@ def scan_map_aoi(req: ScanAoiRequest):
                 kind=EvidenceKind.OBJECT_CONFIDENCE,
                 value=score_val,
                 quality=1.0,
-                source="SarVesselDetector" if z_val == 1 else "OpticalAircraftDetector",
+                source="SarVesselDetector" if target_class == "vessel" else "OpticalAircraftDetector",
                 timestamp_utc=acq_time,
                 uncertainty=0.12,
                 supports=target_class.upper(),
@@ -885,7 +1115,7 @@ def scan_map_aoi(req: ScanAoiRequest):
                     timestamp_utc=acq_time,
                     uncertainty=0.0,
                     supports="NO_MATCH",
-                    references=("state=NO_MATCH", "coverage=VERIFIED"),
+                    references=("state=NO_MATCH", "coverage=VERIFIED", "feed_active=True"),
                     provenance=prov,
                 )
                 supp_ev.append(ev_ais)
@@ -974,7 +1204,7 @@ def scan_map_aoi(req: ScanAoiRequest):
 
         conn.commit()
 
-    return {
+    scan_result = {
         "status": "SUCCESS",
         "scanned_bbox": [min_lon, min_lat, max_lon, max_lat],
         "source": source,
@@ -984,3 +1214,10 @@ def scan_map_aoi(req: ScanAoiRequest):
         "detections_count": len(created_alerts),
         "alerts": created_alerts,
     }
+    scan_prov = {
+        "pipeline_version": "3.0.0",
+        "operator_id": current_user.user_id,
+        "source": source,
+        "timestamp": acq_time.isoformat(),
+    }
+    return envelope_response(data=scan_result, provenance=scan_prov)

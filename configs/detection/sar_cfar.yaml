@@ -1,0 +1,32 @@
+schema_version: "sar_cfar.v1"
+
+ca_cfar:
+  cfar_type: "CA"
+  guard_radius_m: 40.0
+  background_radius_m: 150.0
+  gsd_m: 10.0
+  pfa: 0.00001
+  min_training_cells: 8
+  min_cluster_size_px: 1
+  min_length_m: 10.0
+  max_length_m: 450.0
+  min_width_m: 2.0
+  max_width_m: 100.0
+  min_aspect_ratio: 1.0
+  max_aspect_ratio: 15.0
+
+os_cfar:
+  cfar_type: "OS"
+  guard_radius_m: 40.0
+  background_radius_m: 150.0
+  gsd_m: 10.0
+  pfa: 0.00001
+  k_order_ratio: 0.75
+  min_training_cells: 8
+  min_cluster_size_px: 1
+  min_length_m: 10.0
+  max_length_m: 450.0
+  min_width_m: 2.0
+  max_width_m: 100.0
+  min_aspect_ratio: 1.0
+  max_aspect_ratio: 15.0

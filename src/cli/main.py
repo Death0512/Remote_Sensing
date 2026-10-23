@@ -10,11 +10,16 @@ import yaml
 from src.alerting.package.builder import AlertPackageBuilder
 from src.alerting.priority import determine_alert_priority
 from src.detection.experimental.parallax_detector import ParallaxInflightDetector
-from src.detection.optical.aircraft_detector import OpticalAircraftDetector
+from src.detection.optical.aircraft_detector import (
+    OpticalAircraftDetector,
+    OpticalModelDetector,
+    SkippedLowQuality,
+)
 from src.detection.sar.vessel_detector import SarVesselDetector
 from src.domain.alert import Alert
 from src.domain.confidence import ConfidenceVector
 from src.domain.enums import (
+    AisCorrelationState,
     AlertPriority,
     CalibrationState,
     Capability,
@@ -28,9 +33,12 @@ from src.domain.enums import (
 )
 from src.domain.evidence import Evidence
 from src.domain.hypothesis import Hypothesis
+from src.domain.observation import Observation
 from src.domain.provenance import Provenance
 from src.ingestion.providers.factory import ProviderFactory
 from src.preprocessing.geometry.geofence import GeofenceManager
+from src.preprocessing.optical.preprocessor import OpticalPreprocessor
+from src.provenance.builder import ProvenanceBuilder
 from shapely.geometry import Point, Polygon, mapping
 
 try:
@@ -81,43 +89,123 @@ def handle_scan(args: argparse.Namespace) -> int:
         geofence = GeofenceManager()
         ref_lat, ref_lon = 16.0, 108.0
 
-        detections = []
-        if sensor in ("S1_GRD", "S1_RTC"):
-            try:
-                from src.detectors.sar_vessel import SarVesselDetector as LegacySar
-                legacy_det = LegacySar()
-                raw_dets = legacy_det.detect(source_image, sensor=sensor, land_mask=land_mask)
-                detections.extend(raw_dets)
-            except Exception:
-                pass
-        elif sensor == "S2_L1C":
-            try:
-                from src.detectors.parallax_detector import ParallaxInflightDetector as LegacyParallax
-                legacy_det = LegacyParallax()
-                raw_dets = legacy_det.detect(source_image, sensor=sensor)
-                detections.extend(raw_dets)
-            except Exception:
-                pass
-        elif sensor == "VHR":
-            try:
-                from src.detectors.optical_aircraft import OpticalAircraftDetector as LegacyOptical
-                legacy_det = LegacyOptical()
-                raw_dets = legacy_det.detect(source_image, sensor=sensor)
-                detections.extend(raw_dets)
-            except Exception:
-                pass
-
+        now_utc = datetime.now(timezone.utc)
         output_dir = Path(args.output_dir)
         chips_dir = output_dir / "chips"
         chips_dir.mkdir(parents=True, exist_ok=True)
         builder = AlertPackageBuilder()
+        provenance_builder = ProvenanceBuilder(
+            pipeline_version="3.0.0",
+            config_source={"sensor": sensor, "mode": "cli_scan"},
+        )
+
+        is_sar = (
+            sensor.upper() in {"S1_SAR", "SAR", "S1_GRD", "S1_RTC"}
+            or "SAR" in sensor.upper()
+            or sensor.upper().startswith("S1")
+        )
+        is_optical = (
+            sensor.upper()
+            in {
+                "S2_MSI",
+                "OPTICAL",
+                "VHR_OPTICAL",
+                "S2_L1C",
+                "VHR",
+                "SENTINEL-2",
+                "S2",
+            }
+            or "OPTICAL" in sensor.upper()
+            or sensor.upper().startswith("S2")
+        )
+
+        if is_sar:
+            sar_detector = SarVesselDetector()
+            detections = list(
+                sar_detector.detect(
+                    intensity=img_2d,
+                    land_mask=land_mask,
+                    affine_transform=getattr(source_image, "transform", None),
+                )
+            )
+        elif is_optical:
+            poly = Polygon(
+                [
+                    (ref_lon - 0.5, ref_lat - 0.5),
+                    (ref_lon + 0.5, ref_lat - 0.5),
+                    (ref_lon + 0.5, ref_lat + 0.5),
+                    (ref_lon - 0.5, ref_lat + 0.5),
+                ]
+            )
+            obs_prov = provenance_builder.build(
+                source_asset_id=f"CLI_{sensor}",
+                acquisition_metadata_ref=str(image_path),
+                input_data=image_path,
+                output_data=b"CLI_OBS_PROV",
+                model_id=f"{sensor.lower()}_obs",
+                model_version="3.0.0",
+                processing_run_id=f"run-obs-{int(now_utc.timestamp())}",
+                provenance_id=f"prov-obs-{int(now_utc.timestamp())}",
+                processing_time_utc=now_utc,
+            )
+            obs = Observation(
+                observation_id=f"obs-cli-{int(now_utc.timestamp())}",
+                source="CLI",
+                platform="OpticalPlatform",
+                sensor=(
+                    SensorType.VHR_OPTICAL
+                    if "VHR" in sensor.upper()
+                    else SensorType.S2_MSI
+                ),
+                product="L1C",
+                processing_level="L1C",
+                acquisition_time_utc=now_utc,
+                crs="EPSG:4326",
+                ground_sample_distance_m=(
+                    0.5 if "VHR" in sensor.upper() else 10.0
+                ),
+                bounds_wgs84=poly,
+                asset_uri=str(image_path),
+                metadata_uri=str(image_path),
+                quality_flags=(),
+                provenance=obs_prov,
+            )
+            preprocessor = OpticalPreprocessor()
+            proc_obs = preprocessor.process(obs)
+            detector_mode = getattr(args, "detector", "auto")
+            if detector_mode == "heuristic":
+                opt_detector = OpticalAircraftDetector(
+                    pixel_spacing_m=obs.ground_sample_distance_m
+                )
+            elif detector_mode == "model":
+                opt_detector = OpticalModelDetector()
+            else:
+                try:
+                    opt_detector = OpticalModelDetector()
+                except Exception:
+                    opt_detector = OpticalAircraftDetector(
+                        pixel_spacing_m=obs.ground_sample_distance_m
+                    )
+            det_res = opt_detector.detect(
+                processed_observation=proc_obs,
+                image=img_2d,
+                pixel_spacing_m=obs.ground_sample_distance_m,
+                affine_transform=getattr(source_image, "transform", None),
+                acquisition_time_utc=now_utc,
+            )
+            detections = (
+                [] if isinstance(det_res, SkippedLowQuality) else list(det_res)
+            )
+        else:
+            detections = []
 
         is_dark_flag = getattr(args, "is_dark", None)
         features = []
-        now_utc = datetime.now(timezone.utc)
+
+        has_valid_transform = getattr(source_image, "transform", None) is not None
 
         for idx, det in enumerate(detections, start=1):
-            if hasattr(det, "geom_wgs84"):
+            if hasattr(det, "geom_wgs84") and has_valid_transform:
                 centroid = det.geom_wgs84.centroid
                 lat, lon = float(centroid.y), float(centroid.x)
                 geom_map = mapping(det.geom_wgs84)
@@ -127,28 +215,41 @@ def handle_scan(args: argparse.Namespace) -> int:
 
             zone_enum = geofence.classify_zone(lat, lon)
             zone_num = 1 if zone_enum == Zone.ZONE_1 else (2 if zone_enum == Zone.ZONE_2 else 3)
-            is_dark = is_dark_flag if is_dark_flag is not None else (zone_num == 1)
-
             target_class = getattr(det, "target_class", "vessel")
             raw_conf = getattr(det, "confidence", 0.85)
             score_val = float(raw_conf.raw_score) if hasattr(raw_conf, "raw_score") else float(raw_conf)
 
-            stmt = HypothesisStatement.DARK_VESSEL_TRANSITING if is_dark else HypothesisStatement.UNVERIFIED_SURFACE_TARGET
+            verified_coverage = bool(getattr(args, "verified_ais_coverage", False))
+            has_no_match = bool(is_dark_flag) if is_dark_flag is not None else False
+            is_plausible_detection = score_val >= 0.5
+
+            if verified_coverage and has_no_match and is_plausible_detection:
+                stmt = HypothesisStatement.DARK_VESSEL_TRANSITING
+                is_dark = True
+                ais_state = AisCorrelationState.NO_MATCH.value
+                ais_refs = ("state=NO_MATCH", "coverage=VERIFIED", f"detection_score={score_val:.2f}")
+                ais_qual = 0.95
+                ais_unc = 0.05
+            else:
+                stmt = HypothesisStatement.UNVERIFIED_SURFACE_TARGET
+                is_dark = False
+                ais_state = AisCorrelationState.AIS_UNAVAILABLE.value
+                ais_refs = ("state=AIS_UNAVAILABLE", "coverage=UNVERIFIED", "feed_active=False")
+                ais_qual = 0.0
+                ais_unc = 1.0
+
             priority_val = determine_alert_priority(zone_enum, stmt)
             assigned_id = f"ALT_CLI_{idx:03d}_{int(now_utc.timestamp())}"
 
-            prov = Provenance(
-                provenance_id=f"prov-{assigned_id}",
+            prov = provenance_builder.build(
                 source_asset_id=f"CLI_{sensor}",
                 acquisition_metadata_ref=str(image_path),
-                pipeline_version="2.0.0",
-                git_commit="30d2bc8",
-                config_hash="cli-cfg-v2",
-                model_id="v2-cli-scanner",
-                model_version="2.0.0",
-                input_checksum="cli-input-sha",
-                output_checksum="cli-output-sha",
+                input_data=image_path,
+                output_data=assigned_id.encode("utf-8"),
+                model_id=f"{sensor.lower()}_detector",
+                model_version="3.0.0",
                 processing_run_id=f"run-cli-{int(now_utc.timestamp())}",
+                provenance_id=f"prov-{assigned_id}",
                 processing_time_utc=now_utc,
             )
 
@@ -164,23 +265,20 @@ def handle_scan(args: argparse.Namespace) -> int:
                     supports=str(target_class).upper(),
                     references=(f"sensor={sensor}", f"score={score_val:.2f}"),
                     provenance=prov,
-                )
+                ),
+                Evidence(
+                    evidence_id=f"ev_{assigned_id}_ais",
+                    kind=EvidenceKind.AIS_CORRELATION,
+                    value=0.0,
+                    quality=ais_qual,
+                    source="AisCorrelator",
+                    timestamp_utc=now_utc,
+                    uncertainty=ais_unc,
+                    supports=ais_state,
+                    references=ais_refs,
+                    provenance=prov,
+                ),
             ]
-            if is_dark:
-                supp_ev.append(
-                    Evidence(
-                        evidence_id=f"ev_{assigned_id}_ais",
-                        kind=EvidenceKind.AIS_CORRELATION,
-                        value=0.0,
-                        quality=1.0,
-                        source="AisCorrelator",
-                        timestamp_utc=now_utc,
-                        uncertainty=0.0,
-                        supports="NO_MATCH",
-                        references=("state=NO_MATCH", "coverage=VERIFIED"),
-                        provenance=prov,
-                    )
-                )
 
             hyp = Hypothesis(
                 hypothesis_id=f"hyp_{assigned_id}",
@@ -217,8 +315,9 @@ def handle_scan(args: argparse.Namespace) -> int:
                     chips={"raw": chip_arr, "preview": chip_arr, "analysis": chip_arr},
                     output_dir=output_dir,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                sys.stderr.write(f"Alert packaging failed for {assigned_id}: {exc}\n")
+                raise RuntimeError(f"Failed to generate alert package for {assigned_id}") from exc
 
             feat = {
                 "type": "Feature",
@@ -445,9 +544,26 @@ def cli_entrypoint(argv: Optional[List[str]] = None) -> int:
     scan_parser.add_argument(
         "--sensor",
         type=str,
-        choices=["S1_GRD", "S1_RTC", "S2_L1C", "VHR"],
+        choices=[
+            "S1_GRD",
+            "S1_RTC",
+            "S1_SAR",
+            "SAR",
+            "S2_L1C",
+            "S2_MSI",
+            "OPTICAL",
+            "VHR",
+            "VHR_OPTICAL",
+        ],
         default="S1_GRD",
         help="Sensor type",
+    )
+    scan_parser.add_argument(
+        "--detector",
+        type=str,
+        choices=["auto", "model", "heuristic"],
+        default="auto",
+        help="Detector mode: auto, model, or heuristic",
     )
     scan_parser.add_argument(
         "--output-dir",
@@ -460,6 +576,18 @@ def cli_entrypoint(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         default=None,
         help="Flag indicating unverified/dark target",
+    )
+    scan_parser.add_argument(
+        "--verified-ais-coverage",
+        action="store_true",
+        default=False,
+        help="Flag asserting verified active AIS receiver coverage across scanned AOI",
+    )
+    scan_parser.add_argument(
+        "--ais-records",
+        type=str,
+        default=None,
+        help="Path to AIS records JSON file for correlation",
     )
     scan_parser.add_argument(
         "--land-mask",
