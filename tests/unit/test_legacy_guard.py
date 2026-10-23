@@ -1,14 +1,18 @@
 import ast
 from pathlib import Path
 
-LEGACY_DIRS = ("core", "detectors", "engine")
+LEGACY_DIRS = ("core", "detectors", "engine", "fusion", "evaluation")
 FORBIDDEN_MODULE_PREFIXES = (
     "src.core",
     "src.detectors",
     "src.engine",
+    "src.fusion",
+    "src.evaluation",
     "core",
     "detectors",
     "engine",
+    "fusion",
+    "evaluation",
 )
 
 
@@ -21,7 +25,7 @@ def _get_active_src_files() -> list[Path]:
 def test_legacy_directories_completely_removed() -> None:
     repo_root = Path(__file__).resolve().parent.parent.parent
     src_dir = repo_root / "src"
-    for d in ("core", "detectors", "engine"):
+    for d in LEGACY_DIRS:
         assert not (src_dir / d).exists()
 
 
