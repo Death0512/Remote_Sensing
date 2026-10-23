@@ -26,26 +26,44 @@ class SarVesselDetector:
         cfar_detector: Optional[LocalCfarDetector] = None,
         min_length_m: float = 10.0,
         max_length_m: float = 450.0,
+        min_width_m: float = 2.0,
+        max_width_m: float = 100.0,
         min_aspect_ratio: float = 1.0,
         max_aspect_ratio: float = 15.0,
         pixel_spacing_m: float = 10.0,
     ) -> None:
-        self.cfar_detector = cfar_detector or LocalCfarDetector()
+        self.cfar_detector = cfar_detector or LocalCfarDetector(gsd_m=pixel_spacing_m)
         self.min_length_m = min_length_m
         self.max_length_m = max_length_m
+        self.min_width_m = min_width_m
+        self.max_width_m = max_width_m
         self.min_aspect_ratio = min_aspect_ratio
         self.max_aspect_ratio = max_aspect_ratio
         self.pixel_spacing_m = pixel_spacing_m
 
     def detect(
         self,
-        processed_observation: ProcessedObservation,
-        intensity: np.ndarray,
+        intensity: Optional[Any] = None,
+        processed_observation: Optional[ProcessedObservation] = None,
         land_mask: Optional[np.ndarray] = None,
         pixel_spacing_m: Optional[float] = None,
         affine_transform: Optional[Any] = None,
         acquisition_time_utc: Optional[datetime] = None,
+        **kwargs: Any,
     ) -> Tuple[Detection, ...]:
+        if isinstance(intensity, ProcessedObservation) and (
+            processed_observation is None or isinstance(processed_observation, np.ndarray)
+        ):
+            intensity, processed_observation = processed_observation, intensity
+        elif processed_observation is None and "processed_observation" in kwargs:
+            processed_observation = kwargs.pop("processed_observation")
+
+        if intensity is None and "intensity" in kwargs:
+            intensity = kwargs.pop("intensity")
+
+        if intensity is None:
+            raise ValueError("intensity array is required")
+
         spacing = pixel_spacing_m if pixel_spacing_m is not None else self.pixel_spacing_m
         candidates = self.cfar_detector.detect(
             intensity=intensity,
@@ -66,13 +84,15 @@ class SarVesselDetector:
 
             if not (self.min_length_m <= length_m <= self.max_length_m):
                 continue
+            if not (self.min_width_m <= width_m <= self.max_width_m):
+                continue
             if not (self.min_aspect_ratio <= aspect_ratio <= self.max_aspect_ratio):
                 continue
 
             quality_score = (
                 1.0
-                if processed_observation.quality_tier == QualityTier.DATA_OK
-                else 0.5
+                if (processed_observation and processed_observation.quality_tier == QualityTier.DATA_OK)
+                else (0.85 if processed_observation is None else 0.5)
             )
             confidence = ConfidenceVector(
                 raw_score=snr,
@@ -87,7 +107,7 @@ class SarVesselDetector:
                 provenance_id=f"prov-det-{uuid4().hex[:12]}",
                 source_asset_id=cand.provenance.source_asset_id,
                 acquisition_metadata_ref=cand.provenance.acquisition_metadata_ref,
-                pipeline_version="2.0.0",
+                pipeline_version="3.0.0",
                 git_commit=cand.provenance.git_commit,
                 config_hash=cand.provenance.config_hash,
                 model_id=None,

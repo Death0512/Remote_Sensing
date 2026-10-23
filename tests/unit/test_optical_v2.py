@@ -178,6 +178,11 @@ def test_parallax_detector_emits_experimental_evidence_not_alerts() -> None:
         image_rgb=rgb,
         pixel_spacing_m=10.0,
         inter_band_delay_s=0.5,
+        sensor_metadata={
+            "line_time": 0.001,
+            "acquisition_time_utc": "2026-10-22T12:00:00Z",
+            "inter_band_delay_s": 0.5,
+        },
     )
 
     assert isinstance(evidences, tuple)

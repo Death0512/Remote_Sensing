@@ -1,16 +1,19 @@
 from datetime import datetime, timezone
 import math
-from typing import Any
+from typing import Any, Optional
 import uuid
 import numpy as np
 import pyproj
+from shapely.geometry import Point
 
 from src.domain.detection import Detection
-from src.domain.enums import Capability, TrackLifecycle
+from src.domain.enums import Capability, GeometryStatus, MotionClass, TrackLifecycle
 from src.domain.provenance import Provenance
 from src.domain.track import Track
-from src.tracking.association.hungarian import GatedHungarianAssociator
+from src.provenance.engine import compute_bytes_checksum, get_git_commit
+from src.tracking.association.hungarian import MahalanobisAssociator
 from src.tracking.filters.kalman import KalmanFilter2D
+from src.tracking.motion_models import MotionModelConfig, get_motion_model, target_class_to_motion_class
 
 
 class TrackState:
@@ -20,6 +23,7 @@ class TrackState:
         initial_detection: Detection,
         initial_xy: tuple[float, float],
         initial_time: datetime,
+        motion_class: Optional[MotionClass] = None,
     ) -> None:
         self.track_id = track_id
         self.detections: list[Detection] = [initial_detection]
@@ -27,13 +31,32 @@ class TrackState:
         self.hits = 1
         self.misses = 0
         self.lifecycle = TrackLifecycle.TENTATIVE
+
+        if motion_class is not None:
+            self.motion_class = motion_class
+        else:
+            target_cls = getattr(initial_detection, "target_class", None)
+            self.motion_class = target_class_to_motion_class(target_cls)
+
+        self.motion_model = get_motion_model(self.motion_class)
+        initial_cov = self._get_initial_covariance()
         self.kf = KalmanFilter2D(
             initial_state=np.array([initial_xy[0], initial_xy[1], 0.0, 0.0]),
-            initial_covariance=np.diag([25.0, 25.0, 100.0, 100.0]),
-            process_noise_std=1.0,
-            measurement_noise_std=5.0,
+            initial_covariance=initial_cov,
+            motion_model=self.motion_model,
         )
         self.predicted_pos = (float(initial_xy[0]), float(initial_xy[1]))
+
+    def _get_initial_covariance(self) -> np.ndarray:
+        meas_std = self.motion_model.default_measurement_noise_std
+        pos_var = meas_std**2
+        if self.motion_class == MotionClass.STATIONARY:
+            return np.diag([pos_var, pos_var, 1e-4, 1e-4])
+        if self.motion_class == MotionClass.VESSEL:
+            return np.diag([pos_var, pos_var, 100.0, 100.0])
+        if self.motion_class == MotionClass.AIRCRAFT:
+            return np.diag([pos_var, pos_var, 2500.0, 2500.0])
+        return np.diag([pos_var, pos_var, 100.0, 100.0])
 
     def predict(self, dt: float) -> tuple[float, float]:
         if dt > 0.0:
@@ -41,8 +64,14 @@ class TrackState:
             self.predicted_pos = (float(state[0, 0]), float(state[1, 0]))
         return self.predicted_pos
 
-    def update_matched(self, detection: Detection, xy: tuple[float, float], timestamp: datetime) -> None:
-        self.kf.update(np.array([xy[0], xy[1]]))
+    def update_matched(
+        self,
+        detection: Detection,
+        xy: tuple[float, float],
+        timestamp: datetime,
+        measurement_cov: Optional[np.ndarray] = None,
+    ) -> None:
+        self.kf.update(np.array([xy[0], xy[1]]), measurement_cov=measurement_cov)
         self.detections.append(detection)
         self.last_update_time = timestamp
         self.hits += 1
@@ -63,16 +92,17 @@ class MultiLookTracker:
 
     def __init__(
         self,
-        gate_distance_m: float = 5000.0,
-        max_dt_seconds: float = 7200.0,
+        gate_distance_m: Optional[float] = None,
+        max_dt_seconds: Optional[float] = None,
         max_coast_misses: int = 2,
         center_lat: float = 16.0,
         center_lon: float = 108.0,
+        associator: Optional[Any] = None,
     ) -> None:
         self.gate_distance_m = gate_distance_m
         self.max_dt_seconds = max_dt_seconds
         self.max_coast_misses = max_coast_misses
-        self.associator = GatedHungarianAssociator()
+        self.associator = associator if associator is not None else MahalanobisAssociator()
         self.active_tracks: dict[str, TrackState] = {}
         self.aeqd_proj_string = (
             f"+proj=aeqd +lat_0={center_lat} +lon_0={center_lon} +datum=WGS84 +units=m +no_defs"
@@ -101,6 +131,12 @@ class MultiLookTracker:
         lon, lat = self.backward_transform(x, y)
         return float(lon), float(lat)
 
+    def _get_effective_max_dt(self, motion_class: MotionClass) -> float:
+        model = get_motion_model(motion_class)
+        if self.max_dt_seconds is not None:
+            return min(self.max_dt_seconds, model.max_dt_seconds)
+        return model.max_dt_seconds
+
     def update(self, detections: list[Detection], current_time_utc: datetime) -> list[Track]:
         current_time = self._ensure_utc(current_time_utc)
 
@@ -110,7 +146,8 @@ class MultiLookTracker:
         for tid in existing_track_ids:
             track_state = self.active_tracks[tid]
             dt = (current_time - track_state.last_update_time).total_seconds()
-            if dt > self.max_dt_seconds:
+            effective_max_dt = self._get_effective_max_dt(track_state.motion_class)
+            if dt > effective_max_dt:
                 track_state.lifecycle = TrackLifecycle.TERMINATED
             elif track_state.lifecycle != TrackLifecycle.TERMINATED:
                 track_state.predict(dt)
@@ -119,13 +156,35 @@ class MultiLookTracker:
         det_objects: list[dict[str, Any]] = []
         for det in detections:
             xy = self._geom_to_xy(det.geom_wgs84)
-            det_objects.append({"det": det, "xy": xy, "pos": xy})
+            time_unc = 0.0
+            if hasattr(det, "time_uncertainty_seconds") and det.time_uncertainty_seconds is not None:
+                time_unc = float(det.time_uncertainty_seconds)
+            elif hasattr(det, "attributes") and det.attributes:
+                time_unc = float(dict(det.attributes).get("time_uncertainty_seconds", 0.0))
+
+            meas_cov = None
+            if hasattr(det, "measurement_covariance") and det.measurement_covariance is not None:
+                meas_cov = np.asarray(det.measurement_covariance, dtype=np.float64)
+            elif hasattr(det, "attributes") and det.attributes:
+                meas_std = dict(det.attributes).get("measurement_noise_std")
+                if meas_std is not None:
+                    meas_cov = np.eye(2, dtype=np.float64) * (float(meas_std) ** 2)
+
+            det_objects.append(
+                {
+                    "det": det,
+                    "xy": xy,
+                    "pos": xy,
+                    "time_uncertainty_seconds": time_unc,
+                    "measurement_covariance": meas_cov,
+                }
+            )
 
         candidate_states = [self.active_tracks[tid] for tid in active_candidates]
         matched, unmatched_trks, unmatched_dets = self.associator.associate(
             candidate_states,
             det_objects,
-            self.gate_distance_m,
+            gate_distance_m=self.gate_distance_m,
         )
 
         for trk_idx, det_idx in matched:
@@ -135,6 +194,7 @@ class MultiLookTracker:
                 detection=det_info["det"],
                 xy=det_info["xy"],
                 timestamp=current_time,
+                measurement_cov=det_info["measurement_covariance"],
             )
 
         for trk_idx in unmatched_trks:
@@ -177,6 +237,25 @@ class MultiLookTracker:
         cov_diag = np.diag(track_state.kf.covariance)
         pos_var = float(cov_diag[0] + cov_diag[1])
         track_confidence = max(0.1, min(0.99, 1.0 / (1.0 + pos_var / 1000.0)))
+        quality = float(max(0.1, min(1.0, track_confidence * (1.0 - 0.1 * track_state.misses))))
+
+        state_tuple = (x, y, vx, vy)
+        cov_tuple = tuple(
+            tuple(float(track_state.kf.covariance[r, c]) for c in range(4))
+            for r in range(4)
+        )
+        det_ids = tuple(
+            d.detection_id for d in track_state.detections if hasattr(d, "detection_id")
+        )
+        sensor_sources = tuple(
+            sorted(
+                set(
+                    d.sensor.value if hasattr(d.sensor, "value") else str(d.sensor)
+                    for d in track_state.detections
+                    if hasattr(d, "sensor") and d.sensor is not None
+                )
+            )
+        )
 
         state_estimates = (
             (
@@ -193,28 +272,55 @@ class MultiLookTracker:
             ),
         )
 
-        latest_det = track_state.detections[-1]
-        prov = Provenance(
-            provenance_id=f"prov-trk-{uuid.uuid4().hex[:8]}",
-            source_asset_id=latest_det.provenance.source_asset_id,
-            acquisition_metadata_ref=latest_det.provenance.acquisition_metadata_ref,
-            pipeline_version="2.0.0",
-            git_commit="fedcba9",
-            config_hash="cfg-tracker-v2",
-            model_id=None,
-            model_version=None,
-            input_checksum=latest_det.provenance.output_checksum,
-            output_checksum=f"chk-{uuid.uuid4().hex[:8]}",
-            processing_run_id=latest_det.provenance.processing_run_id,
-            processing_time_utc=current_time,
-            parent_provenance_id=latest_det.provenance.provenance_id,
-        )
+        prov = self._create_provenance(track_state, current_time)
 
         return Track(
             track_id=track_state.track_id,
-            detection_ids=tuple(d.detection_id for d in track_state.detections),
+            detection_ids=det_ids,
             state_estimates=state_estimates,
             track_confidence=track_confidence,
             lifecycle=track_state.lifecycle,
             provenance=prov,
+            schema_version="track.v3",
+            geometry_status=GeometryStatus.GEOCODED,
+            geometry=Point(lon, lat),
+            motion_class=track_state.motion_class,
+            state=state_tuple,
+            state_covariance=cov_tuple,
+            last_update_utc=track_state.last_update_time,
+            prediction_time_utc=current_time,
+            associated_detection_ids=det_ids,
+            sensor_sources=sensor_sources,
+            quality=quality,
+        )
+
+    def _create_provenance(self, track_state: TrackState, current_time: datetime) -> Provenance:
+        latest_det = track_state.detections[-1]
+        det_prov = getattr(latest_det, "provenance", None)
+        source_asset = det_prov.source_asset_id if det_prov else "asset-track"
+        meta_ref = det_prov.acquisition_metadata_ref if det_prov else "s3://meta/track.xml"
+        proc_run_id = det_prov.processing_run_id if det_prov else f"run-trk-{uuid.uuid4().hex[:8]}"
+        parent_id = det_prov.provenance_id if det_prov else None
+        in_chk = det_prov.output_checksum if det_prov else compute_bytes_checksum(b"trk-input")
+        out_bytes = (
+            f"{track_state.track_id}:{track_state.hits}:{track_state.misses}:{track_state.kf.state.ravel().tolist()}"
+        ).encode("utf-8")
+        out_chk = compute_bytes_checksum(out_bytes)
+
+        return Provenance(
+            provenance_id=f"prov-trk-{uuid.uuid4().hex[:12]}",
+            source_asset_id=source_asset,
+            acquisition_metadata_ref=meta_ref,
+            pipeline_version="3.0.0",
+            git_commit=get_git_commit(),
+            config_hash=compute_bytes_checksum(
+                f"cfg-tracker-v3-{track_state.motion_class.value}".encode("utf-8")
+            ),
+            model_id=None,
+            model_version=None,
+            input_checksum=in_chk,
+            output_checksum=out_chk,
+            processing_run_id=proc_run_id,
+            processing_time_utc=current_time,
+            parent_provenance_id=parent_id,
         )

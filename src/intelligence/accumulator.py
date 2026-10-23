@@ -84,6 +84,8 @@ class EvidenceAccumulator:
         self,
         kind: Optional[Union[EvidenceKind, str]] = None,
         source: Optional[str] = None,
+        target_id: Optional[str] = None,
+        track_id: Optional[str] = None,
         predicate: Optional[Callable[[Evidence], bool]] = None,
     ) -> tuple[Evidence, ...]:
         results = self._evidence
@@ -92,6 +94,26 @@ class EvidenceAccumulator:
             results = [ev for ev in results if ev.kind == target_kind]
         if source is not None:
             results = [ev for ev in results if ev.source == source]
+        if target_id is not None:
+            results = [
+                ev
+                for ev in results
+                if any(
+                    ref == f"target_id={target_id}"
+                    or ref.startswith(f"target_id={target_id}")
+                    for ref in ev.references
+                )
+            ]
+        if track_id is not None:
+            results = [
+                ev
+                for ev in results
+                if any(
+                    ref == f"track_id={track_id}"
+                    or ref.startswith(f"track_id={track_id}")
+                    for ref in ev.references
+                )
+            ]
         if predicate is not None:
             results = [ev for ev in results if predicate(ev)]
         return tuple(results)
@@ -102,6 +124,22 @@ class EvidenceAccumulator:
     @property
     def evidence(self) -> tuple[Evidence, ...]:
         return tuple(self._evidence)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_id": self.target_id,
+            "track_id": self.track_id,
+            "location": self.location,
+            "total_items": len(self._evidence),
+            "evidence_ids": [ev.evidence_id for ev in self._evidence],
+            "kinds": {
+                kind.value: len(self.get_by_kind(kind))
+                for kind in {ev.kind for ev in self._evidence}
+            },
+        }
+
+    def summary(self) -> dict[str, Any]:
+        return self.to_dict()
 
     def clear(self) -> None:
         self._evidence.clear()

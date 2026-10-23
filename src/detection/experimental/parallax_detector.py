@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 import hashlib
 import math
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 import numpy as np
 import scipy.ndimage
@@ -10,6 +10,10 @@ from src.domain.enums import Capability, EvidenceKind
 from src.domain.evidence import Evidence
 from src.domain.observation import ProcessedObservation
 from src.domain.provenance import Provenance
+
+
+class ParallaxQuarantineError(ValueError):
+    pass
 
 
 class ParallaxInflightDetector:
@@ -74,16 +78,42 @@ class ParallaxInflightDetector:
         pixel_spacing_m: Optional[float] = None,
         inter_band_delay_s: Optional[float] = None,
         peak_threshold: Optional[float] = None,
+        sensor_metadata: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Evidence, ...]:
+        meta = sensor_metadata
+        if meta is None and hasattr(processed_observation, "metadata"):
+            meta = getattr(processed_observation, "metadata")
+
+        has_sensor_meta = False
+        if meta is not None and isinstance(meta, dict):
+            has_line_time = (
+                "line_time" in meta
+                or "line_period_s" in meta
+                or "detector_line_time_utc" in meta
+                or "inter_band_delay_s" in meta
+            )
+            has_acq_time = (
+                "acquisition_time_utc" in meta
+                or "acquisition_start_utc" in meta
+                or "sensing_time" in meta
+            )
+            if has_line_time and has_acq_time:
+                has_sensor_meta = True
+
+        if not has_sensor_meta:
+            raise ParallaxQuarantineError(
+                "QUARANTINED (D8): ParallaxInflightDetector strictly requires real sensor line-time and acquisition metadata. Heuristic guessing on plain rendered RGB images without timestamp metadata is forbidden."
+            )
+
         spacing = (
             pixel_spacing_m
             if pixel_spacing_m is not None
             else self.pixel_spacing_m
         )
         delay_s = (
-            inter_band_delay_s
-            if inter_band_delay_s is not None
-            else self.inter_band_delay_s
+            float(meta.get("inter_band_delay_s", self.inter_band_delay_s))
+            if meta and "inter_band_delay_s" in meta
+            else (inter_band_delay_s if inter_band_delay_s is not None else self.inter_band_delay_s)
         )
         threshold = (
             peak_threshold
@@ -169,7 +199,7 @@ class ParallaxInflightDetector:
                         provenance_id=f"prov-ev-kin-{uuid4().hex[:12]}",
                         source_asset_id=processed_observation.provenance.source_asset_id,
                         acquisition_metadata_ref=processed_observation.provenance.acquisition_metadata_ref,
-                        pipeline_version="2.0.0",
+                        pipeline_version="3.0.0",
                         git_commit=processed_observation.provenance.git_commit,
                         config_hash=processed_observation.provenance.config_hash,
                         model_id=None,

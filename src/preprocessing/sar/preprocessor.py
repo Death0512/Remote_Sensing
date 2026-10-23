@@ -5,9 +5,10 @@ from uuid import uuid4
 import numpy as np
 from scipy.ndimage import binary_dilation
 
-from src.domain.enums import Capability, GeometricState, QualityTier, RadiometricState
+from src.domain.enums import Capability, GeometricState, GeometryStatus, QualityTier, RadiometricState
 from src.domain.observation import Observation, ProcessedObservation
 from src.domain.provenance import Provenance
+from src.preprocessing.calibration.sar import SarCalibrator
 
 
 class SarPreprocessor:
@@ -15,6 +16,7 @@ class SarPreprocessor:
 
     def __init__(self, buffer_pixels: int = 2) -> None:
         self.buffer_pixels = max(0, buffer_pixels)
+        self.calibrator = SarCalibrator()
 
     def buffer_land_mask(self, land_mask: np.ndarray) -> np.ndarray:
         if self.buffer_pixels == 0:
@@ -69,6 +71,12 @@ class SarPreprocessor:
         else:
             geometric_state = GeometricState.GEOCODED
 
+        geom_status = (
+            observation.geometry_status
+            if hasattr(observation, "geometry_status")
+            else GeometryStatus.GEOCODED
+        )
+
         masks = []
         if land_mask is not None:
             masks.append(("land_mask", f"buffered_{self.buffer_pixels}px"))
@@ -77,7 +85,7 @@ class SarPreprocessor:
             provenance_id=f"prov-proc-{uuid4().hex[:12]}",
             source_asset_id=observation.provenance.source_asset_id,
             acquisition_metadata_ref=observation.metadata_uri,
-            pipeline_version="2.0.0",
+            pipeline_version="3.0.0",
             git_commit=observation.provenance.git_commit,
             config_hash=observation.provenance.config_hash,
             model_id=None,
@@ -100,4 +108,6 @@ class SarPreprocessor:
             masks=tuple(masks),
             quality_tier=quality_tier,
             provenance=proc_prov,
+            geometry_status=geom_status,
+            geometry=observation.geometry,
         )

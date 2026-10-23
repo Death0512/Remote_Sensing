@@ -18,28 +18,59 @@ class LocalCfarDetector:
 
     def __init__(
         self,
-        guard_radius_px: int = 4,
-        background_radius_px: int = 15,
+        guard_radius_px: Optional[int] = None,
+        background_radius_px: Optional[int] = None,
         pfa: float = 1e-5,
         cfar_type: str = "CA",
         k_order_ratio: float = 0.75,
         min_training_cells: int = 8,
         min_cluster_size_px: int = 1,
+        guard_radius_m: Optional[float] = None,
+        background_radius_m: Optional[float] = None,
+        gsd_m: float = 10.0,
     ) -> None:
-        if guard_radius_px < 0:
+        if gsd_m <= 0.0:
+            raise ValueError("gsd_m must be strictly positive")
+
+        if guard_radius_m is not None:
+            g_px = max(1, int(round(guard_radius_m / gsd_m)))
+        elif guard_radius_px is not None:
+            g_px = guard_radius_px
+        else:
+            g_px = max(1, int(round(40.0 / gsd_m))) if background_radius_m is not None else 4
+
+        if background_radius_m is not None:
+            b_px = max(g_px + 1, int(round(background_radius_m / gsd_m)))
+        elif background_radius_px is not None:
+            b_px = background_radius_px
+        else:
+            b_px = max(g_px + 1, int(round(150.0 / gsd_m))) if guard_radius_m is not None else 15
+
+        if g_px < 0:
             raise ValueError("guard_radius_px cannot be negative")
-        if background_radius_px <= guard_radius_px:
+        if b_px <= g_px:
             raise ValueError("background_radius_px must be strictly greater than guard_radius_px")
         if not (0.0 < pfa < 1.0):
             raise ValueError("pfa must be in (0, 1)")
 
-        self.guard_radius_px = guard_radius_px
-        self.background_radius_px = background_radius_px
-        self.pfa = pfa
+        self.gsd_m = float(gsd_m)
+        self.guard_radius_px = int(g_px)
+        self.background_radius_px = int(b_px)
+        self.guard_radius_m = (
+            float(guard_radius_m)
+            if guard_radius_m is not None
+            else float(self.guard_radius_px * self.gsd_m)
+        )
+        self.background_radius_m = (
+            float(background_radius_m)
+            if background_radius_m is not None
+            else float(self.background_radius_px * self.gsd_m)
+        )
+        self.pfa = float(pfa)
         self.cfar_type = cfar_type.upper()
-        self.k_order_ratio = k_order_ratio
-        self.min_training_cells = max(1, min_training_cells)
-        self.min_cluster_size_px = max(1, min_cluster_size_px)
+        self.k_order_ratio = float(k_order_ratio)
+        self.min_training_cells = max(1, int(min_training_cells))
+        self.min_cluster_size_px = max(1, int(min_cluster_size_px))
 
         offsets = []
         for dr in range(-self.background_radius_px, self.background_radius_px + 1):
@@ -100,7 +131,7 @@ class LocalCfarDetector:
             mu_bg = np.zeros((h, w), dtype=np.float64)
             snr_map = np.zeros((h, w), dtype=np.float64)
 
-            padded_intensity = np.pad(intensity, b, mode="reflect")
+            padded_intensity = np.pad(masked_intensity, b, mode="constant", constant_values=0.0)
             padded_valid = np.pad(valid, b, mode="constant", constant_values=False)
 
             r_indices, c_indices = np.where(valid)
@@ -110,7 +141,8 @@ class LocalCfarDetector:
                 sample_r = pr + self.offsets[:, 0]
                 sample_c = pc + self.offsets[:, 1]
                 cell_valid = padded_valid[sample_r, sample_c]
-                if np.sum(cell_valid) < self.min_training_cells:
+                valid_count = int(np.sum(cell_valid))
+                if valid_count < self.min_training_cells:
                     continue
 
                 train_cells = padded_intensity[sample_r[cell_valid], sample_c[cell_valid]]
@@ -228,7 +260,7 @@ class LocalCfarDetector:
                 provenance_id=f"prov-cand-{uuid4().hex[:12]}",
                 source_asset_id=src_asset,
                 acquisition_metadata_ref=meta_ref,
-                pipeline_version="2.0.0",
+                pipeline_version="3.0.0",
                 git_commit=(
                     processed_observation.provenance.git_commit
                     if processed_observation

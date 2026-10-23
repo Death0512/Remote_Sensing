@@ -18,3 +18,4 @@ class Provenance:
     processing_run_id: str
     processing_time_utc: datetime
     parent_provenance_id: Optional[str] = None
+    schema_version: str = "provenance.v3"

@@ -17,6 +17,12 @@
             </div>
         </div>
         <div class="header-metrics">
+            <div class="auth-bar" style="display: flex; align-items: center; gap: 6px; margin-right: 16px;">
+                <input type="text" id="auth-username" placeholder="Username" style="background: #1e293b; color: #f8fafc; border: 1px solid #334155; padding: 4px 6px; border-radius: 3px; font-size: 11px; width: 85px;">
+                <input type="password" id="auth-password" placeholder="Password" style="background: #1e293b; color: #f8fafc; border: 1px solid #334155; padding: 4px 6px; border-radius: 3px; font-size: 11px; width: 85px;">
+                <button id="auth-login-btn" style="background: #0284c7; color: #fff; border: none; padding: 4px 8px; border-radius: 3px; font-size: 11px; font-weight: 600; cursor: pointer;">LOGIN</button>
+                <span id="auth-status-indicator" style="font-size: 10px; color: var(--text-secondary); font-weight: 700;">UNAUTHENTICATED</span>
+            </div>
             <div class="metric-box">
                 <span class="metric-label">SYSTEM HEALTH</span>
                 <span class="metric-value status-online" id="sys-health">OPERATIONAL</span>
